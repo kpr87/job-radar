@@ -1,0 +1,121 @@
+name: job-radar
+
+on:
+  # Times are UTC. As shipped, the first run is 11:23 UTC (6:23 a.m. US Eastern in winter). Shift all four
+  # lines by the same amount to suit your morning, and keep FINAL_CRON below equal to the last line.
+  # The first run reads the sources and hands the postings to Claude as a batch (half price, answered later).
+  # The later runs only collect the batch results and send the digest as soon as scoring is complete.
+  # The last one sends the digest with whatever is ready. Each run takes a few minutes.
+  schedule:
+    - cron: "23 11 * * *"    # read the sources, submit the quick pass
+    - cron: "53 11 * * *"    # collect, submit the full assessments
+    - cron: "38 12 * * *"    # collect, send the digest
+    - cron: "38 13 * * *"    # last call: send the digest with what is ready (keep in step with FINAL_CRON below)
+  workflow_dispatch:
+    inputs:
+      digest_now:
+        description: "Also send the daily digest now"
+        type: boolean
+        default: false
+      clear_errors:
+        description: "Clear the problem list (report only new problems)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: job-radar
+  cancel-in-progress: false
+
+permissions:
+  contents: write            # needed to save the job database to the "state" branch
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install (locked versions)
+        run: uv sync --locked
+
+      # The database of every posting seen lives on the "state" branch (one commit, replaced each run).
+      # The Actions cache is kept as a second copy and is used only when the branch does not exist yet.
+      - name: Restore job database from the state branch
+        id: state
+        run: |
+          mkdir -p data
+          if git fetch --depth 1 origin state 2>/dev/null && git show FETCH_HEAD:jobs.db > data/jobs.db 2>/dev/null; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Restored jobs.db from the state branch ($(du -h data/jobs.db | cut -f1))"
+          else
+            rm -f data/jobs.db
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No state branch yet; falling back to the Actions cache"
+          fi
+
+      - name: Restore job database from the cache (fallback)
+        if: steps.state.outputs.found != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: job-radar-db-${{ github.run_id }}
+          restore-keys: job-radar-db-
+
+      - name: Run Job Radar
+        env:
+          JSEARCH_API_KEY: ${{ secrets.JSEARCH_API_KEY }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DIGEST_NOW: ${{ inputs.digest_now }}
+          CLEAR_ERRORS: ${{ inputs.clear_errors }}
+          THIS_CRON: ${{ github.event.schedule }}
+          FINAL_CRON: "38 13 * * *"
+        run: |
+          ARGS=""
+          # A run started by hand reads every source now, waits up to 45 minutes for Claude's batches
+          # and then sends the digest with what is ready.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then ARGS="$ARGS --force-collect --final --wait-minutes 45"; fi
+          if [ "$THIS_CRON" = "$FINAL_CRON" ]; then ARGS="$ARGS --final"; fi
+          if [ "$DIGEST_NOW" = "true" ]; then ARGS="$ARGS --digest-now"; fi
+          if [ "$CLEAR_ERRORS" = "true" ]; then ARGS="$ARGS --clear-errors"; fi
+          uv run jobradar run $ARGS
+
+      - name: Save job database to the state branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          [ -s data/jobs.db ] || { echo "No database to save"; exit 0; }
+          tmp="$(mktemp -d)"
+          cp data/jobs.db "$tmp/jobs.db"
+          cd "$tmp"
+          git init -q -b state
+          git add jobs.db
+          git -c user.name="job-radar" -c user.email="job-radar@users.noreply.github.com" \
+              commit -q -m "Job database after run ${GITHUB_RUN_ID}"
+          git push -q -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" state
+
+      - name: Save job database to the cache (second copy)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: job-radar-db-${{ github.run_id }}
+
+      - name: Upload ranked report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-radar-report
+          path: |
+            out/ranked.csv
+            out/report.html
+          retention-days: 14
+          if-no-files-found: ignore
