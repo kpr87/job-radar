@@ -1,0 +1,203 @@
+# Test fixture: a sample search (integration architect, remote US or the NJ / NYC / Philadelphia / DE area).
+# The tests run against this file, so they do not depend on what you put in the real config.yaml.
+
+alerts:
+  to: you@example.com
+  digest_every_run: true        # one email per run listing every job ranked since the last email
+  digest_min_score: 6.0         # jobs at or above this rank are listed; 8.0+ are marked as strong matches
+  strong_match_score: 8.0
+  instant_min_score: null       # separate instant alert email; off because runs are daily (set e.g. 8.0 to turn on)
+  digest_hour_local: 7          # used only when digest_every_run is false
+  timezone: America/New_York
+
+salary:
+  # Pay is NOT a filter. Whatever pay or hourly rate a posting states is shown in the digest, nothing more.
+  # To filter on pay again, set a number here (for example 140000): postings whose stated top of range
+  # is below it are then dropped, and hourly contract rates are compared at 2,080 hours a year.
+  min_annual_usd: null
+  keep_when_missing: true
+
+employment:
+  # Full-time and contract roles (corp-to-corp, W2, contract-to-hire) are all kept and labeled in the digest.
+  # Postings whose employment type contains one of these words are dropped.
+  exclude: [Part-time, Internship]
+
+location:
+  work_models: [remote, hybrid, onsite]
+  remote:
+    scope: US
+    # Remote roles that require residence somewhere else are dropped.
+    allowed_residency_states: [NJ, NY, PA, DE]
+  local_areas:                  # hybrid and onsite roles must be in one of these
+    - {name: New Jersey, state: NJ}
+    - {name: Delaware, state: DE}
+    - {name: New York City, center: [40.7128, -74.0060], radius_mi: 25, in_state: NY,
+       towns: [new york, new york city, nyc, manhattan, brooklyn, queens, bronx, staten island, long island city,
+               yonkers, white plains, purchase, tarrytown, new rochelle, great neck, garden city]}
+    - {name: Philadelphia, center: [39.9526, -75.1652], radius_mi: 35, in_state: PA,
+       towns: [philadelphia, conshohocken, king of prussia, wayne, radnor, malvern, blue bell, west chester, exton]}
+
+freshness:
+  # Every run looks at postings from the last 24 hours on every source, no more.
+  # overlap_hours is added so a run that starts late leaves no gap; a posting seen twice is stored once.
+  max_age_hours: 24
+  overlap_hours: 2
+  # catch_up: true brings back the old behavior: 7 days on a source's first run, and a longer window
+  # after a source has been down, up to first_run_max_age_hours.
+  catch_up: false
+  first_run_max_age_hours: 168
+
+schedule:
+  # The workflow starts several times each morning. Only the first run reads the sources; the later ones
+  # just collect Claude's batch results and send the digest. Sources are read again after this many hours.
+  collect_every_hours: 20
+
+titles:
+  # A title must match at least one include pattern and no exclude pattern (case-insensitive regex).
+  # Titles are kept loose on purpose: the skills check, pay floor and Claude scoring narrow them down.
+  include:
+    - 'integration'                 # Integration Architect / Engineer / Lead / Manager (any seniority), Developer, Analyst
+    - 'middleware'                  # Middleware Architect / Engineer
+    - '\barchitect'                 # Solutions, Application, Enterprise, Integration, Cloud, Data, API, Platform Architect
+    - 'forward[- ]deployed'         # Forward Deployed Engineer / Architect
+    - 'enterprise\s+applications?'  # Enterprise Applications Lead / Manager / Director
+    - '\bapi\b.*(platform|lead|manager|engineer|architect)|(lead|manager|engineer),?\s+api\b'
+    - '(engineer|architect|lead|manager),?\s+(of\s+)?(applied\s+)?(ai|gen\s?ai|generative ai)\b'   # "Engineer, AI"
+    - 'technical lead|tech lead'
+    - '\b(principal|staff|lead)\b.*\bengineer'
+    - '\b(senior|sr\.?)\s+software\s+engineer'
+    - 'engineering\s+manager|manager,?\s+(software\s+)?engineering'
+    - 'platform\s+engineer|cloud\s+engineer'
+    - '\bassociate\s+(director|vice\s+president|vp)\b|\bavp\b'
+    - '\bai\b.*(platform|engineer|lead|architect)|agentic|gen\s?ai|generative ai|\bllm\b|\bmcp\b'   # AI / Gen AI Engineer, Agentic AI
+    - 'esb|mulesoft|app connect|\bace\b|\biib\b|kafka|event[- ]driven'
+  exclude:
+    # "Associate" is blocked unless it is Associate Director or Associate Vice President / VP
+    - '\bjunior\b|\bjr\.?\b|\bintern\b|internship|entry[- ]level|\bassociate\b(?!\s+(director|vice\s+president|vp)\b)'
+    - '\bsales\b|account executive|recruiter|\bsdr\b|pre-?sales'   # \b keeps Salesforce titles
+    - 'building|landscape|interior|construction|civil|electrical|mechanical'
+    - 'nurse|physician|clinical(?!.*(data|integration))'
+
+skills_gate:
+  # Checked on title + description before any Claude call (free).
+  # A posting needs at least min_core core skills and at least min_total skills overall.
+  enabled: true
+  min_core: 1
+  min_total: 3            # raised from 2 now that the supporting list is broader
+  short_description_chars: 80    # shorter than this is a snippet, not the posting: skip the check, let Claude judge
+  # "A | B" means one skill with several names, counted once.
+  core: [
+    Kafka, "MuleSoft | Anypoint", "MQ | IBM MQ | WebSphere MQ",
+    "App Connect | IBM ACE | IIB | Integration Bus | Message Broker", "ESB | Enterprise Service Bus", middleware,
+    API gateway, API management, event-driven, event streaming, integration architecture, enterprise integration,
+    "Apache Camel | Camel", "Red Hat Fuse | JBoss Fuse", "ActiveMQ | AMQ", "X12 | EDI",
+    "SSIS | SQL Server Integration Services", "Azure Data Factory | ADF",
+    "MCP | Model Context Protocol", agentic, AI agent, "LLM | large language model", RAG,
+    "tool calling | function calling", "forward deployed"]
+  supporting: [
+    AWS, Azure, microservices, REST API, OpenAPI, SOAP, ETL, data pipeline, Kubernetes, Docker, CI/CD, Spring Boot,
+    Splunk, "Synapse | SQL Data Warehouse", "Microsoft Fabric | MS Fabric | OneLake", OAuth,
+    "Salesforce | Commerce Cloud", Java, Python, SQL]
+  # Dropped when the posting REQUIRES one of these (same sentence as required / must / mandatory).
+  # "Boomi a plus" is kept; "Boomi experience required" is dropped.
+  # An either/or list that also names one of your core skills is kept: "MuleSoft, Boomi or Workato required".
+  drop_if_required: [security clearance, secret clearance, TS/SCI, public trust, Boomi, Informatica, SAP PI/PO,
+                     SAP PO, TIBCO, Oracle SOA, Workato, HL7, FHIR]
+
+sources:
+  jsearch:
+    enabled: true
+    endpoint: openwebninja       # or "rapidapi" if your key came from RapidAPI
+    every_hours: 1               # minimum hours between JSearch calls; daily runs always qualify
+    # date_posted is chosen automatically from the look-back window.
+    pages_per_search: 2          # 10 results per page; daily: 35 searches x 2 = 70 requests (about 2,100 a month)
+    first_run_pages: 3           # used only with freshness.catch_up: true
+    queries:                     # each query runs for each location below (7 x 5 = 35 searches)
+      - integration architect
+      - MuleSoft OR Kafka OR "App Connect" architect
+      - AI platform architect OR agentic AI architect
+      - solutions architect OR application architect OR middleware architect
+      - integration engineer OR integration developer OR integration lead OR integration manager
+      - forward deployed engineer OR AI engineer OR generative AI engineer
+      - platform engineer integration OR API
+    locations:
+      - {label: Remote US, where: "", remote_only: true}
+      - {label: New Jersey, where: "in New Jersey"}
+      - {label: New York City, where: "in New York, NY"}
+      - {label: Philadelphia, where: "in Philadelphia, PA"}
+      - {label: Delaware, where: "in Delaware"}
+  linkedin:
+    enabled: true
+    provider: apify
+    actor: curious_coder~linkedin-jobs-scraper   # Apify actor, billed per result (about $1 per 1,000)
+    max_jobs_per_search: 60      # per LinkedIn search link
+    max_results_per_run: 900     # hard cap on billed results per run (about $0.90)
+    max_wait_minutes: 20
+    # LinkedIn keyword search. Each group runs for each location below (3 x 5 = 15 searches a day).
+    # LinkedIn returns full-time and contract postings alike; nothing here limits the employment type.
+    keyword_groups:
+      - '"integration architect" OR "solutions architect" OR "enterprise architect" OR "application architect" OR "API architect" OR "integration lead" OR "integration manager" OR middleware'
+      - 'MuleSoft OR Kafka OR "App Connect" OR "IBM ACE" OR "agentic AI" OR "AI architect" OR "integration engineer" OR "integration developer"'
+      - '"forward deployed engineer" OR "AI engineer" OR "generative AI engineer" OR "GenAI engineer" OR "platform engineer" OR "middleware architect" OR "integration manager"'
+    searches:
+      - {label: Remote US, location: "United States", workplace: remote}
+      - {label: New Jersey, location: "New Jersey, United States", workplace: onsite_hybrid}
+      - {label: New York City, location: "New York City Metropolitan Area", workplace: onsite_hybrid}
+      - {label: Philadelphia, location: "Greater Philadelphia", workplace: onsite_hybrid}
+      - {label: Delaware, location: "Delaware, United States", workplace: onsite_hybrid}
+  dice:
+    # Dice.com through Dice's own public MCP server (https://mcp.dice.com/mcp): free, no key, no login.
+    # Dice is where most corp-to-corp and other contract roles are posted.
+    enabled: true
+    employment_types: [FULLTIME, CONTRACTS, THIRD_PARTY]   # Dice's names; THIRD_PARTY is corp-to-corp through an agency
+    jobs_per_page: 100           # Dice allows 1 to 100
+    pages_per_search: 1
+    pause_seconds: 1             # between calls; Dice publishes no rate limit, so stay gentle
+    snippet_chars: 400           # Dice returns a summary; one shorter than this skips the skills check and goes to Claude
+    keywords:                    # each keyword runs for each search below (12 x 5 = 60 calls a day)
+      - integration architect
+      - integration engineer
+      - integration developer
+      - integration lead
+      - middleware architect
+      - solutions architect
+      - application architect
+      - MuleSoft
+      - IBM App Connect
+      - agentic AI
+      - AI engineer
+      - forward deployed engineer
+    searches:
+      - {label: Remote US, workplace_types: [Remote]}
+      - {label: New Jersey, location: "New Jersey, USA", workplace_types: [On-Site, Hybrid]}
+      - {label: New York City, location: "New York, NY", radius_mi: 25, workplace_types: [On-Site, Hybrid]}
+      - {label: Philadelphia, location: "Philadelphia, PA", radius_mi: 35, workplace_types: [On-Site, Hybrid]}
+      - {label: Delaware, location: "Wilmington, DE", radius_mi: 40, workplace_types: [On-Site, Hybrid]}
+  ats_boards:
+    enabled: true                # companies are listed in companies.yaml
+    workday_search_terms: [integration, architect, middleware, AI platform]
+    workday_max_pages: 5         # 20 postings a page, per search term
+    new_company_backfill: false  # true: the first run after a company is added lists all its open roles, whatever their age
+
+scoring:
+  triage_model: claude-haiku-5-5
+  deep_model: claude-sonnet-5-5
+  deep_min_triage: 6             # triage score (0-10) needed for the full assessment
+  max_triage_per_run: null       # no limit: every posting that passes the filters gets the quick pass
+  triage_chars: 8000             # how much of the posting the quick pass reads (requirements often sit past 4,000)
+  max_deep_per_run: null         # no limit: every posting at or above deep_min_triage gets the full assessment
+  batch:
+    # Score through Anthropic's Message Batches API: half the price, answered later (usually well within an hour).
+    # A run submits the batch and waits poll_minutes; if it is not done, the next run of the morning collects it.
+    # false: direct calls at full price, answered at once (same as: jobradar run --direct).
+    enabled: true
+    poll_minutes: 6              # scheduled runs wait this long; a run started by hand waits longer (set in the workflow)
+    poll_seconds: 30
+  description_chars: 12000
+  weights:                       # final rank out of 10
+    hiring_manager_fit: 0.50
+    keyword_match: 0.35
+    seniority_pay: 0.075
+    freshness: 0.075
+  hard_gap_cap: 5.9              # a required hard gap caps the rank here: just under digest_min_score, so it stays out
+                                 # of the email (still in ranked.csv). Set to 6.0 to list hard-gap jobs under "Worth a look".

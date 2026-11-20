@@ -1,0 +1,10 @@
+# Optional. Check Claude's scores against your own judgment.
+# Copy this file once per past posting, fill it in, then run:  uv run jobradar calibrate -v
+# If Claude's numbers are more than about 5 points from yours, adjust the "Hard gaps" or "Calibration"
+# sections of profile/profile.md and run again. Files with an empty "posting" are skipped.
+company: Example Co
+title: Senior Data Engineer
+location: Chicago, IL (hybrid)
+salary: "$150,000 to $175,000"
+expected_fit: 80          # your own estimate, 0 to 100
+posting: |
