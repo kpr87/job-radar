@@ -1,0 +1,178 @@
+# Job Radar settings. Edit and commit; the next run picks up changes.
+#
+# This file ships as a worked EXAMPLE for a fictional senior data engineer in Chicago.
+# Replace the email address, the location, the titles, the skills and the searches with your own.
+# Every section says what it does. Anything marked "example" is meant to be changed.
+
+alerts:
+  to: you@example.com           # where the digest is sent (example: change this)
+  digest_every_run: true
+  digest_min_score: 6.0         # jobs ranked at or above this are listed; strong_match_score and above come first
+  strong_match_score: 8.0
+  instant_min_score: null       # a separate alert email for very strong matches; null = off (for example 8.5 = on)
+  digest_hour_local: 7          # used only when digest_every_run is false
+  timezone: America/Chicago     # example: your time zone, used for times shown in the email
+
+salary:
+  # Pay as a filter. null = pay is only shown in the digest, never used to drop a posting.
+  # A number (for example 120000) drops postings whose stated top of range is below it;
+  # hourly contract rates are compared at 2,080 hours a year. Postings with no pay are kept either way.
+  min_annual_usd: null
+  keep_when_missing: true
+
+employment:
+  # Each posting is labeled Full-time, Contract, Contract (C2C), Contract (W2), Contract to hire, Part-time or Internship.
+  # Postings whose label contains one of these words are dropped. To see only full-time roles, add: Contract
+  exclude: [Part-time, Internship]
+
+location:
+  work_models: [remote, hybrid, onsite]     # remove any you do not want
+  remote:
+    scope: US
+    # Remote postings that require living in other states are dropped. List the states you could work from.
+    # Leave the list empty to keep every remote posting.
+    allowed_residency_states: [IL]          # example
+  # Hybrid and onsite postings must fall inside one of these areas. Two kinds of area:
+  #   a whole state:   - {name: Illinois, state: IL}
+  #   a circle:        - {name: Chicago, center: [lat, lon], radius_mi: 30, in_state: IL, towns: [...]}
+  # For a circle, postings that carry coordinates are measured from the center. Postings that carry only
+  # "Town, ST" are matched against "towns", so list the towns inside your circle (lowercase).
+  local_areas:                              # example
+    - name: Chicago
+      center: [41.8781, -87.6298]
+      radius_mi: 30
+      in_state: IL
+      towns: [chicago, evanston, skokie, oak park, oak brook, rosemont, schaumburg, naperville, downers grove,
+              lombard, elmhurst, des plaines, northbrook, deerfield, glenview, itasca, lisle, westchester]
+
+freshness:
+  # Every run looks at postings from the last 24 hours on every source, no more.
+  # overlap_hours is added so a run that starts late leaves no gap; a posting seen twice is stored once.
+  max_age_hours: 24
+  overlap_hours: 2
+  # catch_up: true = 7 days on a source's first run, and a longer window after a source has been down,
+  # up to first_run_max_age_hours.
+  catch_up: false
+  first_run_max_age_hours: 168
+
+schedule:
+  # The workflow starts several times each morning. Only the first run reads the sources; the later ones
+  # just collect Claude's batch results and send the digest. Sources are read again after this many hours.
+  collect_every_hours: 20
+
+titles:
+  # A title must match at least one include pattern and no exclude pattern (case-insensitive regular expressions).
+  # Keep the include list loose: the skills check and Claude's scoring narrow it down afterwards.
+  include:                                  # example
+    - 'data\s+engineer'                     # Data Engineer, Senior / Staff / Lead Data Engineer
+    - 'analytics\s+engineer'
+    - 'data\s+(platform|infrastructure|architect)'
+    - '\b(principal|staff|lead)\b.*\bengineer'
+    - 'etl|elt|data\s+pipeline|data\s+warehouse'
+    - 'machine\s+learning\s+engineer|\bml\s+engineer|mlops'
+  exclude:
+    - '\bjunior\b|\bjr\.?\b|\bintern\b|internship|entry[- ]level'
+    - '\bsales\b|account executive|recruiter'
+    - 'civil|mechanical|electrical|construction'
+
+skills_gate:
+  # A free check on the title and description before any Claude call.
+  # A posting needs at least min_core of your core skills and at least min_total skills overall.
+  # "A | B" means one skill with several names, counted once. Matching ignores case and handles plurals
+  # and hyphens ("event-driven" also matches "event driven").
+  enabled: true
+  min_core: 1
+  min_total: 3
+  short_description_chars: 80    # a description shorter than this is a snippet: skip the check, let Claude judge
+  core: [                                   # example: the skills that define your work
+    Spark, "Airflow | Apache Airflow", dbt, Snowflake, Databricks, "BigQuery | Big Query", Redshift,
+    "Kafka | Apache Kafka", "data pipeline | data pipelines", ETL, ELT, "data warehouse | data warehousing",
+    data lake, lakehouse, data modeling, "streaming | stream processing"]
+  supporting: [                             # example: skills you also have
+    Python, SQL, Scala, AWS, Azure, "GCP | Google Cloud", Kubernetes, Docker, Terraform, CI/CD,
+    "PostgreSQL | Postgres", Flink, Iceberg, Delta Lake, Looker, Tableau, "data quality", "data governance",
+    "machine learning", MLOps]
+  # Dropped when the posting REQUIRES one of these (the same sentence says required / must / mandatory).
+  # "Informatica a plus" is kept; "Informatica experience required" is dropped.
+  # An either/or list that also names one of your core skills is kept: "Snowflake, Teradata or Redshift required".
+  drop_if_required: [security clearance, secret clearance, TS/SCI, public trust, Informatica, Teradata, Ab Initio]   # example
+
+sources:
+  jsearch:
+    # JSearch reads Google for Jobs, which covers Indeed, Glassdoor, ZipRecruiter, company career pages
+    # and part of LinkedIn. Needs the JSEARCH_API_KEY secret.
+    enabled: true
+    endpoint: openwebninja       # or "rapidapi" if your key came from RapidAPI
+    every_hours: 1
+    pages_per_search: 2          # 10 results a page. Requests a day = queries x locations x pages (here 3 x 2 x 2 = 12)
+    first_run_pages: 3           # used only with freshness.catch_up: true
+    queries:                     # example: each query runs for each location below
+      - senior data engineer
+      - data platform engineer OR analytics engineer
+      - Spark OR Airflow OR dbt data engineer
+    locations:                   # example
+      - {label: Remote US, where: "", remote_only: true}
+      - {label: Chicago, where: "in Chicago, IL"}
+  linkedin:
+    # LinkedIn through a third-party Apify scraper that reads LinkedIn's public job search (no LinkedIn login).
+    # Optional and billed by Apify per result. Needs the APIFY_TOKEN secret. Set enabled: false to leave it out.
+    # Note: automated collection is against LinkedIn's user agreement; whether to use this source is your decision.
+    enabled: false
+    provider: apify
+    actor: curious_coder~linkedin-jobs-scraper
+    max_jobs_per_search: 60      # per LinkedIn search
+    max_results_per_run: 300     # hard cap on billed results per run
+    max_wait_minutes: 20
+    keyword_groups:              # example: each group runs for each search below
+      - '"data engineer" OR "analytics engineer" OR "data platform engineer"'
+    searches:                    # example
+      - {label: Remote US, location: "United States", workplace: remote}
+      - {label: Chicago, location: "Greater Chicago Area", workplace: onsite_hybrid}
+  dice:
+    # Dice.com through Dice's own public MCP server (https://mcp.dice.com/mcp): free, no key, no login.
+    # Strong for contract and corp-to-corp roles.
+    enabled: true
+    employment_types: [FULLTIME, CONTRACTS, THIRD_PARTY]   # Dice's names; THIRD_PARTY is corp-to-corp through an agency
+    jobs_per_page: 100           # Dice allows 1 to 100
+    pages_per_search: 1
+    pause_seconds: 1             # between calls; Dice publishes no rate limit, so stay gentle
+    snippet_chars: 400           # Dice returns a summary; one shorter than this skips the skills check and goes to Claude
+    keywords:                    # example: each keyword runs for each search below
+      - data engineer
+      - analytics engineer
+      - data platform engineer
+    searches:                    # example
+      - {label: Remote US, workplace_types: [Remote]}
+      - {label: Chicago, location: "Chicago, IL", radius_mi: 30, workplace_types: [On-Site, Hybrid]}
+  ats_boards:
+    # Target companies' own careers boards (Greenhouse, Lever, Ashby, Workday): free. Companies go in companies.yaml.
+    enabled: true
+    workday_search_terms: [data engineer, data platform, analytics]   # example
+    workday_max_pages: 5         # 20 postings a page, per search term
+    new_company_backfill: false  # true: the first run after a company is added lists all its open roles, whatever their age
+
+scoring:
+  # Claude ranks each posting against profile/profile.md. A quick pass with the small model scores everything;
+  # postings at or above deep_min_triage then get a full assessment with the larger model.
+  # If a run reports "model not found", replace these with current model names from the Anthropic documentation.
+  triage_model: claude-haiku-5-5
+  deep_model: claude-sonnet-5-5
+  deep_min_triage: 6             # quick-pass score (0 to 10) needed for the full assessment
+  max_triage_per_run: null       # null = no limit. A number caps the quick pass per run (cost control)
+  triage_chars: 8000             # how much of the posting the quick pass reads
+  max_deep_per_run: null         # null = no limit. A number caps full assessments per run (cost control)
+  batch:
+    # Score through Anthropic's Message Batches API: half the price, answered later (usually well within an hour).
+    # A run submits the batch and waits poll_minutes; if it is not done, the next run of the morning collects it.
+    # false: direct calls at full price, answered at once (same as: jobradar run --direct).
+    enabled: true
+    poll_minutes: 6              # scheduled runs wait this long; a run started by hand waits longer (set in the workflow)
+    poll_seconds: 30
+  description_chars: 12000
+  weights:                       # final rank out of 10
+    hiring_manager_fit: 0.50
+    keyword_match: 0.35
+    seniority_pay: 0.075
+    freshness: 0.075
+  hard_gap_cap: 5.9              # a required hard gap (see profile.md) caps the rank here, just under digest_min_score,
+                                 # so it stays out of the email (still in ranked.csv). 6.0 lists it under "Worth a look".

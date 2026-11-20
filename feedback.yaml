@@ -1,0 +1,9 @@
+# Your feedback. Edit and commit; the next run applies it.
+# Paste a job URL (from an alert or the digest) under the right list.
+
+applied: []            # removed from future alerts and digests
+
+not_interested: []     # e.g. - {url: https://..., reason: "pure Salesforce admin role"}
+                       # reasons are shown to Claude so similar roles score lower
+
+blocked_companies: []  # e.g. - Example Staffing LLC

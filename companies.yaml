@@ -1,0 +1,11 @@
+# Target-company watchlist, checked on every run for free through each company's public careers API.
+# Add companies with:  uv run jobradar add-company <careers page URL>
+# Supported: Greenhouse, Lever, Ashby, Workday.
+#
+# Entry formats:
+#   - {name: Example Co, ats: greenhouse, token: exampleco}
+#   - {name: Example Co, ats: lever, token: exampleco}
+#   - {name: Example Co, ats: ashby, token: exampleco}
+#   - {name: Example Co, ats: workday, host: exampleco.wd5.myworkdayjobs.com, tenant: exampleco, site: External}
+
+companies: []
