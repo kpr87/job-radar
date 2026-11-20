@@ -1,717 +1,622 @@
-"""End-to-end and unit tests with mocked job APIs and a fake scorer (no network, no API keys)."""
+"""One daily run: collect, dedupe, filter, score, alert, digest, export."""
 from __future__ import annotations
 
+import csv
+import html
 import json
+import logging
+import os
 import re
-import shutil
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import httpx
-import pytest
-
-REPO = Path(__file__).resolve().parents[1]
-FIX = Path(__file__).resolve().parent / "fixtures"      # sample search the tests run against
-NOW = datetime(2026, 11, 2, 12, 5, tzinfo=timezone.utc)
-
-
-def iso(hours_ago: float) -> str:
-    return (NOW - timedelta(hours=hours_ago)).isoformat().replace("+00:00", "Z")
-
-
-def js(i, title, employer, city=None, state=None, remote=False, lat=None, lon=None, smin=None, smax=None,
-       period=None, desc="Design integration services with Kafka, MuleSoft and AWS.", hours_ago=3, publisher="LinkedIn",
-       country="US"):
-    return {"job_id": f"js{i}", "job_title": title, "employer_name": employer, "job_city": city, "job_state": state,
-            "job_country": country, "job_location": ", ".join(x for x in [city, state] if x), "job_is_remote": remote,
-            "job_latitude": lat, "job_longitude": lon, "job_min_salary": smin, "job_max_salary": smax,
-            "job_salary_period": period, "job_description": desc, "job_posted_at_datetime_utc": iso(hours_ago),
-            "job_apply_link": f"https://example.com/apply/{i}", "job_publisher": publisher}
-
-
-JSEARCH = [
-    js(1, "Integration Architect", "Prudential Financial", "Newark", "NJ", smin=150000, smax=190000, period="YEAR",
-       desc="Hybrid, 3 days per week in our Newark office. Kafka, APIs, AWS."),
-    js(2, "Senior Integration Architect", "Lone Star Co", remote=True,
-       desc="Fully remote. Candidates must reside in Texas or Oklahoma."),
-    js(3, "Enterprise Integration Architect", "Peach Corp", "Atlanta", "GA", lat=33.75, lon=-84.39),
-    js(4, "Junior Integration Developer", "Small Co", "Princeton", "NJ"),
-    js(5, "Integration Lead", "Big Bank", "New York", "NY", lat=40.75, lon=-73.99, smin=120000, smax=135000, period="YEAR"),
-    js(6, "Integration Architect (Remote)", "Carolina Bank", "Charlotte", "NC", remote=True,
-       desc="This role is hybrid: 3 days per week in our Charlotte, NC office."),
-    js(7, "Agentic AI Architect", "Pharma Inc", "King of Prussia", "PA", desc="Build agent platforms with MCP."),
-    js(8, "Integration Architect", "Prudential Financial, Inc.", "Newark", "NJ", publisher="Indeed",
-       desc="Hybrid, 3 days per week in our Newark office."),
-    js(9, "MuleSoft Integration Architect (Contract)", "Staffing LLC", remote=True, smin=85, smax=85, period="HOUR",
-       desc="100% remote contract. Must be authorized to work in the United States."),
-    js(10, "Integration Architect", "Old Post Co", "Edison", "NJ", hours_ago=200),   # outside the 7-day first-run window
-    js(11, "Integration Architect", "Hudson Valley Co", "Albany", "NY", lat=42.65, lon=-73.75),
-    js(12, "Middleware Architect", "Westchester Insurance", "Purchase", "NY", desc="Onsite five days. IBM MQ and ACE."),
-    js(13, "Solutions Architect", "Garden State Bank", "Jersey City", "NJ",
-       desc="Hybrid. You will design payment integrations on MuleSoft and Kafka, deployed on AWS, and own the "
-            "API standards for our digital banking channels."),
-    js(14, "Salesforce Architect", "CRM Co", remote=True,
-       desc="Fully remote. Own Salesforce Sales Cloud and Service Cloud design, Apex and Lightning components, "
-            "data model, release management and CI/CD for the CRM team."),
-    js(15, "Integration Architect", "Defense Co", "Philadelphia", "PA",
-       desc="Onsite. Design integrations with MuleSoft and Kafka on AWS. An active Secret clearance is required "
-            "for this position. US citizenship needed."),
-    js(16, "Principal Engineer, Platform", "Fintech Co", "New York", "NY", lat=40.71, lon=-74.01,
-       desc="Hybrid in Manhattan. Build event streaming on Kafka, an API gateway layer and REST APIs on AWS. "
-            "Boomi experience is a plus but not needed."),
-]
-
-GREENHOUSE = {"jobs": [
-    {"id": 101, "title": "Staff Integration Engineer", "location": {"name": "Remote - US"},
-     "absolute_url": "https://boards.greenhouse.io/acme/jobs/101", "first_published": iso(5),
-     "content": "&lt;p&gt;Remote across the US. Salary $175,000 - $210,000 per year.&lt;/p&gt;"},
-    {"id": 102, "title": "Solutions Architect", "location": {"name": "London, United Kingdom"},
-     "absolute_url": "https://boards.greenhouse.io/acme/jobs/102", "first_published": iso(5), "content": "UK role"},
-]}
-LEVER = [{"id": "lv1", "text": "Principal Architect, Integrations", "hostedUrl": "https://jobs.lever.co/beta/lv1",
-          "categories": {"location": "Philadelphia, PA"}, "workplaceType": "hybrid",
-          "salaryRange": {"min": 180000, "max": 220000, "currency": "USD", "interval": "per-year-salary"},
-          "descriptionPlain": "Lead integration architecture.", "createdAt": int((NOW - timedelta(hours=10)).timestamp() * 1000)}]
-ASHBY = {"jobs": [{"id": "as1", "title": "AI Platform Engineer, MCP", "location": "United States", "isRemote": True,
-                   "workplaceType": "Remote", "jobUrl": "https://jobs.ashbyhq.com/gamma/as1", "isListed": True,
-                   "descriptionPlain": "Build MCP servers.", "publishedAt": iso(2),
-                   "compensation": {"compensationTierSummary": "$170K – $210K"}}]}
-WD_LIST = {"jobPostings": [
-    {"title": "Integration Architect", "externalPath": "/job/Wilmington-DE/Integration-Architect_R1", "locationsText": "Wilmington, DE", "postedOn": "Posted Today"},
-    {"title": "Store Associate", "externalPath": "/job/Newark-DE/Store-Associate_R2", "locationsText": "Newark, DE", "postedOn": "Posted Today"},
-]}
-WD_DETAIL = {"jobPostingInfo": {"title": "Integration Architect", "location": "Wilmington, DE", "remoteType": "Hybrid",
-                                "jobDescription": "<p>Design APIs.</p><p>Pay range $145,000 to $185,000</p>",
-                                "jobReqId": "R1", "externalUrl": "https://delta.wd5.myworkdayjobs.com/en-US/Ext/job/R1"}}
-
-
-DICE = [
-    {"id": "d1", "title": "MuleSoft Integration Architect", "companyName": "Apex Systems", "jobLocation": {"displayName": "Remote"},
-     "detailsPageUrl": "https://www.dice.com/job-detail/d1", "salary": "$85 - $95 per hour", "employmentType": "THIRD_PARTY",
-     "workplaceTypes": ["Remote"], "isRemote": True, "postedDate": iso(4),
-     "summary": "12 month contract, corp-to-corp accepted. MuleSoft, IBM MQ, REST API and AWS integration for a retail client. " * 3},
-    {"id": "d2", "title": "Integration Engineer", "companyName": "Garden State Health Plan", "jobLocation": {"displayName": "Trenton, NJ"},
-     "detailsPageUrl": "https://www.dice.com/job-detail/d2", "salary": "", "employmentType": "FULLTIME",
-     "workplaceTypes": ["Hybrid"], "postedDate": iso(6), "summary": "Short snippet only."},
-    {"id": "d3", "title": "Integration Engineer", "companyName": "Weekend Co", "jobLocation": {"displayName": "Remote"},
-     "detailsPageUrl": "https://www.dice.com/job-detail/d3", "employmentType": "PARTTIME",
-     "workplaceTypes": ["Remote"], "isRemote": True, "postedDate": iso(6), "summary": "Part time."},
-]
-DICE_CALLS: list[dict] = []
-
-
-def dice_reply(request: httpx.Request) -> httpx.Response:
-    msg = json.loads(request.content)
-    if "id" not in msg:
-        return httpx.Response(202)
-    if msg["method"] == "initialize":
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": "2025-06-18"}},
-                              headers={"Mcp-Session-Id": "s1"})
-    args = msg["params"]["arguments"]
-    DICE_CALLS.append(args)
-    assert request.headers.get("mcp-session-id") == "s1"
-    hit = args["keyword"] == "integration architect" and args.get("workplace_types") == ["Remote"]
-    payload = {"data": DICE if hit else [], "meta": {"currentPage": 1, "pageCount": 1}}
-    result = {"jsonrpc": "2.0", "id": msg["id"], "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}}
-    # Dice may answer as a server-sent event stream; the client must read both forms
-    return httpx.Response(200, text="event: message\ndata: " + json.dumps(result) + "\n\n",
-                          headers={"content-type": "text/event-stream"})
-
-
-def handler(request: httpx.Request) -> httpx.Response:
-    url = str(request.url)
-    if "mcp.dice.com" in url:
-        return dice_reply(request)
-    if "jsearch" in url:
-        q = request.url.params.get("query", "")
-        return httpx.Response(200, json={"data": JSEARCH if q.startswith("integration architect in New Jersey") else []})
-    if "greenhouse" in url:
-        return httpx.Response(200, json=GREENHOUSE)
-    if "lever" in url:
-        return httpx.Response(200, json=LEVER)
-    if "ashby" in url:
-        return httpx.Response(200, json=ASHBY)
-    if "myworkdayjobs" in url and request.method == "POST":
-        return httpx.Response(200, json=WD_LIST)
-    if "myworkdayjobs" in url:
-        return httpx.Response(200, json=WD_DETAIL)
-    return httpx.Response(404)
-
-
-class FakeScorer:
-    def __init__(self):
-        self.triaged, self.assessed = [], []
-
-    def triage(self, row):
-        self.triaged.append(row["title"])
-        low = "Contract" in row["title"]
-        return {"score": 4 if low else 8, "reason": "test", "location_check": "remote_us" if row["work_model"] == "remote" else "local",
-                "pay_below_floor": False}
-
-    def assess(self, row):
-        self.assessed.append(row["title"])
-        strong = "Principal" in row["title"] or "Prudential" in row["company"]
-        return {"summary": f"{row['title']} role", "keyword_match_pct": 90 if strong else 70,
-                "hiring_manager_fit_pct": 85 if strong else 65, "seniority_pay_pct": 90, "verdict": "apply" if strong else "stretch",
-                "top_gaps": ["gap a"], "hard_gaps": [], "pitch": "Kafka and MCP in production",
-                "location_check": "remote_us" if row["work_model"] == "remote" else "local",
-                "work_model": row["work_model"], "pay_top_annual_usd": None}
-
-
-@pytest.fixture
-def home(tmp_path, monkeypatch):
-    shutil.copy(FIX / "config.yaml", tmp_path / "config.yaml")
-    shutil.copy(REPO / "feedback.yaml", tmp_path / "feedback.yaml")
-    cfg = (tmp_path / "config.yaml").read_text()
-    # These tests exercise the optional catch-up and new-company backfill; the shipped default (a fixed
-    # 24-hour window) has its own test below.
-    for old, new in [("instant_min_score: null", "instant_min_score: 8.0"), ("pause_seconds: 1 ", "pause_seconds: 0 "),
-                     ("catch_up: false", "catch_up: true"), ("new_company_backfill: false", "new_company_backfill: true")]:
-        assert old in cfg, old
-        cfg = cfg.replace(old, new)
-    (tmp_path / "config.yaml").write_text(cfg)
-    monkeypatch.delenv("APIFY_TOKEN", raising=False)
-    DICE_CALLS.clear()
-    (tmp_path / "profile").mkdir()
-    shutil.copy(FIX / "profile.md", tmp_path / "profile" / "profile.md")
-    (tmp_path / "companies.yaml").write_text(
-        "companies:\n"
-        "  - {name: Acme, ats: greenhouse, token: acme}\n"
-        "  - {name: Beta, ats: lever, token: beta}\n"
-        "  - {name: Gamma, ats: ashby, token: gamma}\n"
-        "  - {name: Delta, ats: workday, host: delta.wd5.myworkdayjobs.com, tenant: delta, site: Ext}\n")
-    monkeypatch.setenv("JOBRADAR_HOME", str(tmp_path))
-    monkeypatch.setenv("JSEARCH_API_KEY", "test")
-    monkeypatch.delenv("GMAIL_USER", raising=False)
-    import importlib
-    import jobradar.pipeline as pl
-    importlib.reload(pl)
-    return tmp_path, pl
-
-
-def test_end_to_end(home):
-    tmp, pl = home
-    scorer = FakeScorer()
-    run = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler)), scorer=scorer, now=NOW)
-    counts = run.execute()
-    rows = {(r["title"], r["company"]): r for r in run.store.rows("1=1")}
-    status = {k: (r["status"], r["filter_reason"]) for k, r in rows.items()}
-    for k, v in sorted(status.items()):
-        print(k, v)
-
-    # dedupe: Prudential posted twice (LinkedIn + Indeed) is stored once
-    assert sum(1 for k in rows if k[0] == "Integration Architect" and "Prudential" in k[1]) == 1
-    assert status[("Senior Integration Architect", "Lone Star Co")][0] == "filtered"            # residency TX/OK
-    assert "outside the search area" in status[("Enterprise Integration Architect", "Peach Corp")][1]
-    assert status[("Junior Integration Developer", "Small Co")][1] == "title excluded"
-    assert status[("Integration Lead", "Big Bank")][0] == "scored"                                # pay is no longer a filter
-    assert "$120,000 to $135,000" in rows[("Integration Lead", "Big Bank")]["salary_note"]
-    assert status[("Integration Architect (Remote)", "Carolina Bank")][0] == "filtered"           # mislabeled remote
-    assert "older than" in status[("Integration Architect", "Old Post Co")][1]
-    assert status[("Integration Architect", "Hudson Valley Co")][0] == "filtered"                 # Albany, outside 25 mi
-    assert status[("Solutions Architect", "Acme")][1] == "outside the US"
-    assert ("Store Associate", "Delta") not in rows                                               # title filter before detail call
-    for k in [("Agentic AI Architect", "Pharma Inc"), ("Middleware Architect", "Westchester Insurance"),
-              ("Staff Integration Engineer", "Acme"), ("Principal Architect, Integrations", "Beta"),
-              ("AI Platform Engineer, MCP", "Gamma"), ("Integration Architect", "Delta")]:
-        assert status[k][0] == "scored", k
-    assert status[("MuleSoft Integration Architect (Contract)", "Staffing LLC")][0] == "triaged_low"
-    assert rows[("MuleSoft Integration Architect (Contract)", "Staffing LLC")]["employment_type"] == "Contract"
-    # Dice: corp-to-corp contract kept and labeled, short snippet passed to Claude, part-time dropped
-    c2c = rows[("MuleSoft Integration Architect", "Apex Systems")]
-    assert (c2c["status"], c2c["employment_type"], c2c["publisher"]) == ("scored", "Contract (C2C)", "Dice")
-    assert c2c["salary_min"] == 85 * 2080
-    assert status[("Integration Engineer", "Garden State Health Plan")][0] == "scored"
-    assert rows[("Integration Engineer", "Garden State Health Plan")]["employment_type"] == "Full-time"
-    assert "employment type not wanted" in status[("Integration Engineer", "Weekend Co")][1]
-    first = DICE_CALLS[0]
-    assert first["employment_types"] == ["FULLTIME", "CONTRACTS", "THIRD_PARTY"] and first["posted_date"] == "SEVEN"
-    assert any(c.get("location") == "New York, NY" and c.get("radius") == 25 for c in DICE_CALLS)
-    # skills check
-    assert status[("Solutions Architect", "Garden State Bank")][0] == "scored"
-    assert "MuleSoft" in rows[("Solutions Architect", "Garden State Bank")]["skills"]
-    assert status[("Salesforce Architect", "CRM Co")][1].startswith("skills check")
-    assert status[("Integration Architect", "Defense Co")][1] == "requires secret clearance"
-    assert status[("Principal Engineer, Platform", "Fintech Co")][0] == "scored"     # Boomi only "a plus"
-
-    assert rows[("Middleware Architect", "Westchester Insurance")]["work_model"] == "onsite"
-    assert rows[("Integration Architect", "Delta")]["location_label"] == "Hybrid, Delaware"
-    assert rows[("Integration Architect", "Delta")]["salary_min"] == 145000
-    assert rows[("AI Platform Engineer, MCP", "Gamma")]["salary_max"] == 210000
-    assert rows[("Principal Architect, Integrations", "Beta")]["rank"] >= 8.0
-    assert counts["alerted"] >= 2
-    assert (tmp / "out" / "emails" / "alert.html").exists()
-    assert (tmp / "out" / "emails" / "digest.html").exists()        # 7 a.m. local
-    assert (tmp / "out" / "ranked.csv").exists()
-
-    # second run: nothing new, nothing re-alerted, digest not repeated
-    run2 = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler)), scorer=FakeScorer(),
-                  now=NOW + timedelta(minutes=50))
-    c2 = run2.execute()
-    assert c2["new"] == 0 and c2["alerted"] == 0
-    assert run2.store.rows("status='scored' AND digested_at IS NULL") == []
-
-
-def test_feedback_and_jsearch_every_hours(home):
-    tmp, pl = home
-    cfg = (tmp / "config.yaml").read_text().replace("every_hours: 1 ", "every_hours: 2 ")
-    (tmp / "config.yaml").write_text(cfg)
-    run = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler)), scorer=FakeScorer(), now=NOW)
-    run.execute()
-    import yaml
-    jsc = yaml.safe_load(cfg)["sources"]["jsearch"]
-    assert run.counts["jsearch_calls"] == len(jsc["queries"]) * len(jsc["locations"]) * jsc["first_run_pages"]
-    (tmp / "feedback.yaml").write_text("applied:\n  - https://jobs.lever.co/beta/lv1\nnot_interested: []\nblocked_companies: []\n")
-    run2 = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler)), scorer=FakeScorer(),
-                  now=NOW + timedelta(hours=1))
-    run2.execute()
-    assert run2.counts["jsearch_calls"] == 0       # not due yet
-    assert run2.store.rows("url='https://jobs.lever.co/beta/lv1'")[0]["status"] == "applied"
-
-
-def test_sources_keep_their_own_clock_and_new_companies_backfill(home):
-    tmp, pl = home
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    run = pl.Run(dry_run=True, client=client, scorer=FakeScorer(), now=NOW)
-    run.execute()
-    # LinkedIn had no token, so it never succeeded; JSearch and Dice did
-    later = NOW + timedelta(days=3)
-    run2 = pl.Run(dry_run=True, client=client, scorer=FakeScorer(), now=later)
-    assert run2.lookback("jsearch") == (False, 73)
-    assert run2.lookback("dice") == (False, 73)
-    assert run2.lookback("linkedin") == (True, 168)        # still owed its full first-run window
-    # a company added later shows all its open roles once, however old
-    old = dict(LEVER[0], id="lv9", text="Integration Architect", hostedUrl="https://jobs.lever.co/newco/lv9",
-               createdAt=int((NOW - timedelta(days=40)).timestamp() * 1000))
-
-    def handler2(request):
-        if "lever.co/v0/postings/newco" in str(request.url):
-            return httpx.Response(200, json=[old])
-        return handler(request)
-
-    with open(tmp / "companies.yaml", "a") as f:
-        f.write("  - {name: NewCo, ats: lever, token: newco}\n")
-    run3 = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler2)), scorer=FakeScorer(), now=later)
-    run3.execute()
-    assert run3.store.rows("company='NewCo'")[0]["status"] == "scored"
-    # ...but only once: the same 40-day-old role under a new title is too old on the next run
-    old2 = dict(old, id="lv10", text="Middleware Architect", hostedUrl="https://jobs.lever.co/newco/lv10")
-
-    def handler3(request):
-        if "lever.co/v0/postings/newco" in str(request.url):
-            return httpx.Response(200, json=[old, old2])
-        return handler(request)
-
-    run4 = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler3)), scorer=FakeScorer(),
-                  now=later + timedelta(days=1))
-    run4.execute()
-    assert "older than" in run4.store.rows("title='Middleware Architect' AND company='NewCo'")[0]["filter_reason"]
-
-
-def test_feedback_matches_links_with_tracking_parameters(home):
-    tmp, pl = home
-    f = pl.Run._url_id
-    assert f("https://www.linkedin.com/jobs/view/integration-architect-at-acme-4012345678?refId=abc&trk=x") == "linkedin:4012345678"
-    assert f("https://www.linkedin.com/jobs/view/4012345678/") == "linkedin:4012345678"
-    assert f("https://www.linkedin.com/jobs/search/?currentJobId=4012345678&keywords=x") == "linkedin:4012345678"
-    assert f("https://www.dice.com/job-detail/d1?utm_source=mail") == f("http://dice.com/job-detail/d1/")
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    pl.Run(dry_run=True, client=client, scorer=FakeScorer(), now=NOW).execute()
-    (tmp / "feedback.yaml").write_text(
-        "applied:\n  - https://www.dice.com/job-detail/d1?utm_source=email&utm_medium=digest\n"
-        "not_interested: []\nblocked_companies: [Garden State Bank]\n")
-    run2 = pl.Run(dry_run=True, client=client, scorer=FakeScorer(), now=NOW + timedelta(hours=1))
-    run2.execute()
-    assert run2.store.rows("company='Apex Systems'")[0]["status"] == "applied"
-    assert run2.store.rows("company='Garden State Bank'")[0]["filter_reason"] == "company blocked in feedback.yaml"
-
-
-def test_location_and_work_model_regressions():
-    from jobradar.textparse import detect_work_model, parse_location
-    assert parse_location("New York, NY") == ("New York", "NY", "US")
-    assert parse_location("New York, New York, United States") == ("New York", "NY", "US")
-    assert parse_location("New York, NY (Hybrid)")[:2] == ("New York", "NY")
-    assert parse_location("Washington, DC") == ("Washington", "DC", "US")
-    assert parse_location("New London, CT")[1:] == ("CT", "US")
-    assert parse_location("Albuquerque, New Mexico")[1:] == ("NM", "US")
-    assert parse_location("London, United Kingdom")[2] == "NON_US"
-    assert parse_location("New York, United States") == (None, "NY", "US")       # the state: town unknown
-    tech = "Design our hybrid cloud integration platform and the hybrid integration strategy across on-prem and SaaS."
-    assert detect_work_model("Integration Architect", "Austin, TX", tech, True, "remote") == "remote"
-    assert detect_work_model("Integration Architect", "Austin, TX", tech + " This role is hybrid, 3 days in office.", True, "remote") == "hybrid"
-    assert detect_work_model("Architect", "Jersey City, NJ", "Hybrid. You will design payment integrations.", None, None) == "hybrid"
-    assert detect_work_model("Architect", "Dallas, TX", "Work model: Hybrid", True, None) == "hybrid"
-
-
-def test_filter_regressions():
-    import yaml
-    from jobradar.collectors.linkedin import to_job
-    from jobradar.filters import apply_filters, required_blockers
-    from jobradar.textparse import parse_salary_text
-    cfg = yaml.safe_load((FIX / "config.yaml").read_text())
-    core = cfg["skills_gate"]["core"]
-    block = cfg["skills_gate"]["drop_if_required"]
-    assert required_blockers("Experience with an iPaaS such as MuleSoft, Boomi or Workato is required.", block, core) == []
-    assert required_blockers("Boomi experience is required.", block, core) == ["Boomi"]
-    assert required_blockers("Active Secret clearance is required. MuleSoft a plus.", block, core) == ["secret clearance"]
-    assert parse_salary_text("Pay: $105,000 - $135,000 in most locations; $150,000 - $195,000 in NY and NJ.") == (150000, 195000)
-    assert parse_salary_text("Sign-on bonus of $30,000 to $40,000. Base salary $170,000 to $210,000.") == (170000, 210000)
-
-    body = "We need an integration architect with MuleSoft, IBM MQ, Kafka, REST API, AWS and microservices experience. " * 3
-
-    def li(**kw):
-        it = {"title": "Integration Architect", "companyName": "Acme", "link": "https://www.linkedin.com/jobs/view/1",
-              "descriptionText": body, "postedAtTimestamp": NOW.timestamp() * 1000, "employmentType": "Full-time"}
-        return apply_filters(to_job(it | kw), cfg, {}, NOW)
-
-    assert li(location="New York, NY", workplaceTypes=["On-site"]).reason == "Onsite, New York City"
-    assert li(location="New York, NY", workplaceTypes=["Hybrid"]).status == "candidate"
-    ny_state = li(location="New York, United States", workplaceTypes=["Hybrid"])
-    assert (ny_state.status, ny_state.location_unclear) == ("candidate", True)       # Claude decides
-    assert li(location="Albany, NY", workplaceTypes=["Hybrid"]).status == "filtered"
-    assert li(location="Austin, TX", workplaceTypes=["Remote"], descriptionText=body + " Own the hybrid cloud roadmap.").status == "candidate"
-    low_pay = li(location="United States", workplaceTypes=["Remote"], descriptionText=body + " Salary $95,000 - $110,000.")
-    assert (low_pay.status, low_pay.salary_note) == ("candidate", "$95,000 to $110,000")          # shown, not filtered
-    contract = li(location="United States", workplaceTypes=["Remote"], employmentType="Contract",
-                  descriptionText=body + " 6 month contract, C2C or W2, $90/hr.")
-    assert contract.status == "candidate"
-    assert to_job({"title": "x", "link": "y", "employmentType": "Contract", "descriptionText": "W2 only, no C2C."}).employment_type == "Contract (W2)"
-    assert to_job({"title": "x", "link": "y", "employmentType": "Contract", "descriptionText": "Corp-to-corp welcome."}).employment_type == "Contract (C2C)"
-    assert li(location="United States", workplaceTypes=["Remote"], employmentType="Part-time").status == "filtered"
-
-
-def test_scorer_rules_follow_the_pay_setting():
-    from jobradar.scorer import _system
-    import yaml
-    cfg = yaml.safe_load((FIX / "config.yaml").read_text())
-    assert "Pay is not a criterion" in _system("profile", [], None, cfg)[0]["text"]
-    assert "USD 120,000" in _system("profile", [], 120000, cfg)[0]["text"]
-    rules = _system("profile", [], None, cfg)[0]["text"]
-    assert "within 25 miles of New York City" in rules and "anywhere in Delaware" in rules     # search area comes from config
-    assert "unless they require living outside NJ, NY, PA, DE" in rules
-
-
-def test_shipped_example_config_and_profile_work(tmp_path, monkeypatch):
-    """The example config.yaml and profile in the repo root must load and run end to end."""
-    import importlib
-    import yaml
-    cfg = yaml.safe_load((REPO / "config.yaml").read_text())
-    for pattern in cfg["titles"]["include"] + cfg["titles"]["exclude"]:
-        re.compile(pattern)
-    assert cfg["alerts"]["to"].endswith("@example.com")            # no real address ships in the repo
-    for name in ["config.yaml", "feedback.yaml", "companies.yaml"]:
-        shutil.copy(REPO / name, tmp_path / name)
-    (tmp_path / "config.yaml").write_text((tmp_path / "config.yaml").read_text().replace("pause_seconds: 1 ", "pause_seconds: 0 "))
-    (tmp_path / "profile").mkdir()
-    shutil.copy(REPO / "profile" / "profile.md", tmp_path / "profile" / "profile.md")
-    monkeypatch.setenv("JOBRADAR_HOME", str(tmp_path))
-    monkeypatch.setenv("JSEARCH_API_KEY", "test")
-    monkeypatch.delenv("APIFY_TOKEN", raising=False)
-    monkeypatch.delenv("GMAIL_USER", raising=False)
-    import jobradar.pipeline as pl
-    importlib.reload(pl)
-    posting = js(1, "Senior Data Engineer", "Lakeshore Retail", "Naperville", "IL",
-                 desc="Hybrid, 2 days per week in the office. Build Spark and Airflow data pipelines in Python and SQL "
-                      "feeding a Snowflake data warehouse. dbt experience is a plus.")
-    far = js(2, "Senior Data Engineer", "Coastal Co", "Miami", "FL", desc=posting["job_description"])
-
-    def example_handler(request):
-        if "jsearch" in str(request.url):
-            first = request.url.params.get("query", "").startswith("senior data engineer in Chicago")
-            return httpx.Response(200, json={"data": [posting, far] if first else []})
-        return handler(request)
-
-    run = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(example_handler)), scorer=FakeScorer(), now=NOW)
-    counts = run.execute()
-    assert counts["collected"] == 2
-    kept = run.store.rows("company='Lakeshore Retail'")[0]
-    assert (kept["status"], kept["location_label"]) == ("scored", "Hybrid, Chicago")         # town list in the config
-    assert "Spark" in kept["skills"] and "Airflow" in kept["skills"]
-    assert "outside the search area" in run.store.rows("company='Coastal Co'")[0]["filter_reason"]
-    assert (tmp_path / "out" / "emails" / "digest.html").exists()
-    assert "within 30 miles of Chicago" in __import__("jobradar.scorer", fromlist=["x"]).location_rule(run.cfg)
-
-
-class FakeBatchScorer(FakeScorer):
-    """Speaks the batch interface of the real Scorer. A batch ends after `checks_needed` status checks."""
-
-    def __init__(self, checks_needed=1, fail_keys=()):
-        super().__init__()
-        self.checks_needed, self.fail_keys = checks_needed, set(fail_keys)
-        self.batches: dict[str, dict] = {}
-        self.direct_calls = 0
-
-    def triage(self, row):
-        self.direct_calls += 1
-        return super().triage(row)
-
-    def assess(self, row):
-        self.direct_calls += 1
-        return super().assess(row)
-
-    def batch_submit(self, kind, rows):
-        bid = f"msgbatch_{kind}_{len(self.batches)}"
-        fn = FakeScorer.triage if kind == "triage" else FakeScorer.assess
-        self.batches[bid] = {"kind": kind, "checks": 0,
-                             "results": {r["key"]: (("error", "batch request errored") if r["title"] in self.fail_keys
-                                                    else ("ok", fn(self, r))) for r in rows}}
-        return bid
-
-    def batch_ended(self, bid):
-        self.batches[bid]["checks"] += 1
-        return self.batches[bid]["checks"] >= self.checks_needed
-
-    def batch_results(self, bid):
-        return self.batches[bid]["results"]
-
-
-def _default_config(tmp):
-    """The config as shipped (24-hour window, no limits, batch on), with only the Dice pause removed."""
-    (tmp / "config.yaml").write_text((FIX / "config.yaml").read_text().replace("pause_seconds: 1 ", "pause_seconds: 0 "))
-
-
-def test_batch_scoring_completes_in_one_run_when_claude_is_quick(home):
-    tmp, pl = home
-    _default_config(tmp)
-    scorer = FakeBatchScorer(checks_needed=1, fail_keys={"Agentic AI Architect"})
-    slept = []
-    run = pl.Run(dry_run=True, client=httpx.Client(transport=httpx.MockTransport(handler)), scorer=scorer, now=NOW,
-                 final=False, sleep=slept.append)
-    c = run.execute()
-    kinds = [b["kind"] for b in scorer.batches.values()]
-    assert kinds == ["triage", "deep"]                              # one batch per pass, in order
-    assert c["batches_pending"] == 0 and slept == []
-    assert c["triaged"] >= 8 and c["assessed"] >= 6
-    # direct calls: one probe per model on first use (2), plus the one failed request retried in each pass (2)
-    assert scorer.direct_calls == 4
-    assert json.loads(run.store.get_meta("claude_models"))["checked"] == sorted(
-        {run.cfg["scoring"]["triage_model"], run.cfg["scoring"]["deep_model"]})
-    assert run.store.rows("title='Agentic AI Architect'")[0]["status"] == "scored"
-    assert run.store.rows("status IN ('candidate','awaiting_deep')") == []      # no per-run limit: nothing left waiting
-    assert (tmp / "out" / "emails" / "digest.html").exists()        # scoring complete, so the digest went out
-    assert run.store.get_meta("digest_due") == "0"
-
-
-def test_batch_scoring_carries_over_runs_and_reads_sources_once(home):
-    tmp, pl = home
-    _default_config(tmp)
-    scorer = FakeBatchScorer(checks_needed=3)       # each batch needs three status checks before it ends
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    digest = tmp / "out" / "emails" / "digest.html"
-
-    def run_at(minutes, final=False):
-        r = pl.Run(dry_run=True, client=client, scorer=scorer, now=NOW + timedelta(minutes=minutes),
-                   final=final, wait_minutes=0, sleep=lambda s: None)
-        return r, r.execute()
-
-    r1, c1 = run_at(0)                              # 6:23 run: reads sources, submits the quick pass, does not wait
-    assert c1["collected"] > 0 and c1["batches_pending"] == 1 and c1["triaged"] == 1     # 1 = the one-time model probe
-    assert not digest.exists()                      # held: Claude is still scoring
-    calls_after_first = len(DICE_CALLS)
-
-    r2, c2 = run_at(30)                             # still processing
-    assert c2["collected"] == 0 and len(DICE_CALLS) == calls_after_first        # sources are not read again
-    assert c2["batches_pending"] == 1 and not digest.exists()
-
-    r3, c3 = run_at(75)                             # quick pass done: collected, full assessments submitted
-    assert c3["triaged"] >= 8 and c3["batches_pending"] == 1
-    assert [b["kind"] for b in scorer.batches.values()] == ["triage", "deep"]
-    assert not digest.exists()
-
-    r4, c4 = run_at(135, final=True)                # last call of the morning: batch still out, so email what is ready
-    assert c4["batches_pending"] == 1 and digest.exists()
-    assert "still being scored by Claude" in digest.read_text()
-    digest.unlink()
-
-    r5, c5 = run_at(140)                            # the batch ends; results are applied, held for the next digest
-    assert c5["assessed"] >= 6 and c5["batches_pending"] == 0
-    assert r5.store.rows("status='scored' AND digested_at IS NULL") != []
-    assert scorer.direct_calls == 2                 # only the one-time probe per model; everything else went through batches
-
-    r6, c6 = run_at(24 * 60)                        # next morning: sources read again, yesterday's results in this digest
-    assert c6["collected"] > 0 and digest.exists()
-    assert r6.store.rows("status='scored' AND digested_at IS NULL") == []
-
-
-def test_default_window_is_one_day_on_every_source_every_time(home):
-    tmp, pl = home
-    _default_config(tmp)
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    run = pl.Run(dry_run=True, client=client, scorer=FakeScorer(), now=NOW)
-    for source in ("jsearch", "linkedin", "dice", "ats"):
-        assert run.lookback(source) == (False, 26)          # 24 hours plus the 2-hour overlap, even on a first run
-    run.execute()
-    assert DICE_CALLS[0]["posted_date"] == "ONE"
-    late = pl.Run(dry_run=True, client=client, scorer=FakeScorer(), now=NOW + timedelta(days=5))
-    assert late.lookback("linkedin") == (False, 26)         # no catch-up after days without a run
-    from jobradar.collectors.linkedin import search_urls
-    assert "f_TPR=r93600" in search_urls(run.cfg, 26)[0]
-    from jobradar.collectors.jsearch import date_posted_for
-    assert date_posted_for(26) == "3days"
-    # a posting older than the window is dropped, and a company added later gets no backfill
-    assert "older than 26 hours" in run.store.rows("company='Old Post Co'")[0]["filter_reason"]
-
-
-def test_model_that_refuses_forced_tool_choice_is_remembered_between_runs(home):
-    """A model that rejects a forced tool_choice is found by the one-time probe, the batch is then built
-    without forcing, and the next run already knows (no failed batch, no repeat probe)."""
-    tmp, pl = home
-    _default_config(tmp)
-
-    class Picky(FakeBatchScorer):
-        def __init__(self, deep_model):
-            super().__init__(checks_needed=1)
-            self._auto_choice: set[str] = set()
-            self.deep_model, self.forced_in_batches = deep_model, []
-
-        def assess(self, row):
-            self._auto_choice.add(self.deep_model)          # what the real Scorer learns from the HTTP 400
-            return super().assess(row)
-
-        def batch_submit(self, kind, rows):
-            if kind == "deep":
-                self.forced_in_batches.append(self.deep_model not in self._auto_choice)
-            return super().batch_submit(kind, rows)
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    first = pl.Run(dry_run=True, client=client, scorer=None, now=NOW, final=True, sleep=lambda s: None)
-    first.scorer = Picky(first.cfg["scoring"]["deep_model"])
-    first.execute()
-    assert first.scorer.forced_in_batches == [False]         # the deep batch was not forced
-    saved = json.loads(first.store.get_meta("claude_models"))
-    assert saved["auto_choice"] == [first.cfg["scoring"]["deep_model"]]
-
-    second = pl.Run(dry_run=True, client=client, scorer=None, now=NOW + timedelta(days=1), final=True, sleep=lambda s: None)
-    second.scorer = Picky(second.cfg["scoring"]["deep_model"])
-    second.score([])
-    assert second.cfg["scoring"]["deep_model"] in second.scorer._auto_choice     # loaded from the last run
-    assert second.scorer.direct_calls == 0                                       # no repeat probe
-
-
-def test_real_scorer_speaks_the_batch_api(tmp_path):
-    """The real Scorer against the real Anthropic SDK, with the HTTP layer replaced: checks the batch
-    request that would be sent and that results in every state are read back correctly."""
-    import anthropic
-    import yaml
-    from jobradar.scorer import Scorer, clean_triage
-    try:                        # newer Anthropic SDKs ship their own HTTP library; older ones use httpx
-        import httpx2 as hx
-    except ImportError:
-        hx = httpx
-    seen = {}
-
-    def api(request):
-        path = request.url.path
-        if request.method == "POST" and path.endswith("/messages/batches"):
-            seen["body"] = json.loads(request.content)
-            return hx.Response(200, json=batch("in_progress"))
-        if path.endswith("/results"):
-            ok = {"id": "msg_1", "type": "message", "role": "assistant", "model": "m", "stop_reason": "tool_use",
-                  "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 20},
-                  "content": [{"type": "tool_use", "id": "tu_1", "name": "record_triage",
-                               "input": {"score": 8, "reason": "fits", "location_check": "remote_us", "pay_below_floor": False}}]}
-            lines = [{"custom_id": "aaaa1111bbbb2222", "result": {"type": "succeeded", "message": ok}},
-                     {"custom_id": "cccc3333dddd4444", "result": {"type": "errored", "error": {
-                         "type": "error", "error": {"type": "invalid_request_error", "message": "bad tool_choice"}}}},
-                     {"custom_id": "eeee5555ffff6666", "result": {"type": "expired"}}]
-            return hx.Response(200, text="\n".join(json.dumps(x) for x in lines),
-                                  headers={"content-type": "application/x-jsonl"})
-        return hx.Response(200, json=batch("ended"))
-
-    def batch(status):
-        return {"id": "msgbatch_1", "type": "message_batch", "processing_status": status,
-                "request_counts": {"processing": 0, "succeeded": 1, "errored": 1, "canceled": 0, "expired": 1},
-                "created_at": "2026-11-20T12:00:00Z", "expires_at": "2026-11-21T12:00:00Z", "ended_at": None,
-                "archived_at": None, "cancel_initiated_at": None,
-                "results_url": "https://api.anthropic.com/v1/messages/batches/msgbatch_1/results"}
-
-    client = anthropic.Anthropic(api_key="test", http_client=hx.Client(transport=hx.MockTransport(api)))
-    cfg = yaml.safe_load((FIX / "config.yaml").read_text())
-    (tmp_path / "profile.md").write_text("profile text")
-    scorer = Scorer(cfg, tmp_path / "profile.md", [], client=client)
-    row = {"key": "aaaa1111bbbb2222", "title": "Integration Architect", "company": "Acme", "location": "Remote",
-           "work_model": "remote", "salary_note": "", "publisher": "Dice", "source": "dice", "description": "MuleSoft",
-           "employment_type": "Contract (C2C)"}
-    assert scorer.batch_submit("triage", [row]) == "msgbatch_1"
-    req = seen["body"]["requests"][0]
-    assert req["custom_id"] == "aaaa1111bbbb2222"
-    params = req["params"]
-    assert params["model"] == cfg["scoring"]["triage_model"]
-    assert params["tool_choice"] == {"type": "tool", "name": "record_triage"}
-    assert params["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}     # profile cached for an hour
-    assert "Employment type: Contract (C2C)" in params["messages"][0]["content"]
-    assert scorer.batch_ended("msgbatch_1") is True
-    results = scorer.batch_results("msgbatch_1")
-    assert results["aaaa1111bbbb2222"][0] == "ok" and clean_triage(results["aaaa1111bbbb2222"][1])["score"] == 8
-    assert results["cccc3333dddd4444"] == ("error", "batch request errored: bad tool_choice")
-    assert results["eeee5555ffff6666"] == ("error", "batch request expired")
-
-
-def test_parsers():
-    from jobradar.textparse import detect_work_model, parse_location, parse_salary_text, residency_states
-    assert parse_location("Jersey City, NJ") == ("Jersey City", "NJ", "US")
-    assert parse_location("Philadelphia, Pennsylvania, United States")[1] == "PA"
-    assert parse_location("Toronto, ON, Canada")[2] == "NON_US"
-    assert parse_salary_text("The range is $140K-$165K annually") == (140000, 165000)
-    assert parse_salary_text("$70 - $80 per hour") == (145600, 166400)
-    assert parse_salary_text("Base pay $150,000 to $180,000") == (150000, 180000)
-    assert residency_states("Applicants must reside in New Jersey, New York or Pennsylvania.") == {"NJ", "NY", "PA"}
-    assert residency_states("You must be located in the United States.") is None
-    assert detect_work_model("Architect", "Remote", "Work 2 days a week in the office in Dallas.", True, None) == "hybrid"
-    assert detect_work_model("Architect", "Newark, NJ", "Fully remote role.", None, None) == "remote"
-
-
-def test_skill_terms():
-    from jobradar.filters import required_blockers, skills_in
-    terms = ["event-driven", "REST API", "MQ | IBM MQ | WebSphere MQ", "MCP | Model Context Protocol", "pub/sub"]
-    assert skills_in("Event driven design with REST APIs over WebSphere MQ and pub/sub", terms) == \
-        ["event-driven", "REST API", "MQ", "pub/sub"]
-    assert skills_in("Model Context Protocol servers", terms) == ["MCP"]
-    assert skills_in("in the workplace we squeeze", ["MQ", "EAI"]) == []
-    assert required_blockers("Dell Boomi is a nice to have.", ["Boomi"]) == []
-    assert required_blockers("Must have 5+ years of Boomi.", ["Boomi"]) == ["Boomi"]
-
-
-def test_skill_names_and_aliases_in_gate():
-    import yaml
-    from jobradar.filters import skills_in
-    g = yaml.safe_load((FIX / "config.yaml").read_text())["skills_gate"]
-    camel = "Build routes in Red Hat Fuse and Apache Camel on Spring Boot with ActiveMQ, X12 EDI partner feeds"
-    assert {"Apache Camel", "Red Hat Fuse", "ActiveMQ", "X12"} <= set(skills_in(camel, g["core"]))
-    ms = "Pipelines in Azure Data Factory and SSIS landing into Synapse and Microsoft Fabric, alerts in Splunk"
-    assert {"SSIS", "Azure Data Factory"} <= set(skills_in(ms, g["core"]))
-    assert {"Synapse", "Microsoft Fabric", "Splunk"} <= set(skills_in(ms, g["supporting"]))
-    assert "Microsoft Fabric" not in skills_in("Kids apparel with soft cotton fabric", g["supporting"])
-    fde = "As a Forward Deployed Engineer you ship LLM agents with function calling into customer systems on the Anypoint Platform"
-    assert {"forward deployed", "LLM", "tool calling", "MuleSoft"} <= set(skills_in(fde, g["core"]))
-
-
-def test_title_filter():
-    import yaml
-    from jobradar.filters import title_ok
-    cfg = yaml.safe_load((FIX / "config.yaml").read_text())
-    keep = ["Associate Director, Integration Architecture", "Associate Vice President, Enterprise Architecture",
-            "Associate VP Engineering", "AVP, Data Transformation & Integration Manager", "Senior Software Engineer",
-            "Sr. Software Engineer, Payments", "Engineering Manager, Platform", "Manager, Software Engineering",
-            "Application Architect", "Platform Engineer", "Senior Cloud Engineer", "Integration Developer",
-            "Integration Analyst", "Integration Specialist", "Salesforce Integration Architect"]
-    keep += ["Application Architect", "Platform Engineer", "Senior Integration Engineer", "Senior Integration Manager",
-             "Forward Deployed Engineer", "Forward-Deployed AI Engineer", "AI Engineer", "Gen AI Engineer", "GenAI Engineer",
-             "AI/Gen AI Engineer", "Software Engineer, AI", "Agentic AI Developer", "Integration Engineer", "Integration Lead",
-             "Middleware Architect", "Integration Architect", "Solutions Architect", "Enterprise Applications Lead",
-             "Integration Developer", "Senior Integration Developer", "MuleSoft Integration Developer",
-             "Director, Enterprise Applications", "Senior Manager, API Platform"]
-    drop = ["Associate Integration Developer", "Associate Software Engineer", "Junior Platform Engineer",
-            "Sales Engineer", "Landscape Architect", "Software Engineer Intern"]
-    for t in keep:
-        assert title_ok(t, cfg)[0], t
-    for t in drop:
-        assert not title_ok(t, cfg)[0], t
-
-
-def test_add_company_url_parsing():
-    from jobradar.cli import parse_careers_url
-    assert parse_careers_url("https://job-boards.greenhouse.io/datadog")["token"] == "datadog"
-    assert parse_careers_url("https://jobs.lever.co/palantir/abc")["ats"] == "lever"
-    wd = parse_careers_url("https://comcast.wd5.myworkdayjobs.com/en-US/Comcast_Careers?q=architect")
-    assert wd == {"ats": "workday", "host": "comcast.wd5.myworkdayjobs.com", "tenant": "comcast", "site": "Comcast_Careers"}
+from zoneinfo import ZoneInfo
+
+import yaml
+
+from . import notify
+from .collectors import collect_ats, dice, http_client, jsearch, linkedin
+from .filters import apply_filters
+from .models import _norm
+from .store import Store, now_iso
+
+log = logging.getLogger("jobradar")
+ROOT = Path(os.environ.get("JOBRADAR_HOME", Path.cwd()))
+
+
+def load_yaml(name: str) -> dict:
+    p = ROOT / name
+    return (yaml.safe_load(p.read_text()) or {}) if p.exists() else {}
+
+
+class Run:
+    def __init__(self, dry_run: bool = False, client=None, scorer=None, now: datetime | None = None,
+                 force_jsearch: bool = False, force_collect: bool | None = None, final: bool = True,
+                 wait_minutes: float | None = None, sleep=time.sleep):
+        self.cfg = load_yaml("config.yaml")
+        self.companies = load_yaml("companies.yaml").get("companies") or []
+        self.feedback = load_yaml("feedback.yaml")
+        self.store = Store(ROOT / "data" / "jobs.db")
+        self.out = ROOT / "out"
+        self.dry_run = dry_run
+        self.force_jsearch = force_jsearch
+        self.force_collect = force_jsearch if force_collect is None else force_collect
+        self.final = final                    # last run of the day: email what is ready even if a batch is still out
+        self.wait_minutes = wait_minutes      # how long this run may wait for Claude batches (None: config)
+        self._sleep = sleep
+        self.client = client
+        self.scorer = scorer
+        self.now = now or datetime.now(timezone.utc)
+        self.errors: list[str] = []          # this run's problems, for the run summary
+        self._err_records: list[list] = []   # [time, message, source, job key] kept for the digest
+        self.counts = {"collected": 0, "new": 0, "candidates": 0, "triaged": 0, "assessed": 0, "alerted": 0,
+                       "jsearch_calls": 0, "linkedin_results": 0, "dice_searches": 0, "batches_pending": 0}
+
+    # ---------- feedback ----------
+    @staticmethod
+    def _url_id(url: str | None) -> str:
+        """A URL reduced to what identifies the posting, so a pasted link still matches when it carries
+        tracking parameters. LinkedIn links are reduced to the job number."""
+        u = (url or "").strip()
+        m = re.search(r"linkedin\.com/.*?(?:jobs/view/(?:[^/?#]*-)?|currentJobId=)(\d{6,})", u)
+        if m:
+            return "linkedin:" + m.group(1)
+        u = re.sub(r"^https?://(www\.)?", "", u.split("#")[0].split("?")[0]).rstrip("/")
+        return u.lower()
+
+    def apply_feedback(self) -> list[str]:
+        notes = []
+        index: dict[str, list[str]] = {}
+        for r in self.store.db.execute("SELECT key, url FROM jobs"):
+            index.setdefault(self._url_id(r["url"]), []).append(r["key"])
+            index.setdefault(r["key"], []).append(r["key"])
+
+        def mark(url: str, status: str) -> list[str]:
+            keys = index.get((url or "").strip()) or index.get(self._url_id(url)) or []
+            for k in keys:
+                self.store.db.execute("UPDATE jobs SET status=? WHERE key=?", (status, k))
+            if not keys and url:
+                log.warning("feedback.yaml: no stored job matches %s (copy the link from the digest email)", url)
+            return keys
+
+        for url in self.feedback.get("applied") or []:
+            mark(url, "applied")
+        for item in self.feedback.get("not_interested") or []:
+            url, reason = (item.get("url"), item.get("reason", "")) if isinstance(item, dict) else (item, "")
+            keys = mark(url, "not_interested")
+            row = self.store.db.execute("SELECT title, company FROM jobs WHERE key=?", (keys[0],)).fetchone() if keys else None
+            if row and reason:
+                notes.append(f"{row['title']} at {row['company']}: {reason}")
+            elif reason:
+                notes.append(reason)
+        blocked = {_norm(c) for c in self.feedback.get("blocked_companies") or []}
+        if blocked:   # also applies to postings stored before the company was blocked
+            for r in self.store.rows("status IN ('candidate','awaiting_deep','scored')"):
+                if _norm(r["company"]) in blocked:
+                    self.store.update(r["key"], status="filtered", filter_reason="company blocked in feedback.yaml")
+        self.store.commit()
+        return notes
+
+    # ---------- collect ----------
+    def collect(self) -> list:
+        client = self.client or http_client()
+        src = self.cfg["sources"]
+        windows: dict[str, int] = {}
+        jobs = []
+
+        js = src["jsearch"]
+        if js.get("enabled"):
+            backfill, hours = self.lookback("jsearch")
+            windows["jsearch"] = hours
+            last = self.store.get_meta("jsearch_last_run")
+            due = self.force_jsearch or last is None or \
+                (self.now - datetime.fromisoformat(last)) >= timedelta(hours=js.get("every_hours", 1), minutes=-15)
+            if due:
+                found, errs, calls, ok = jsearch.fetch(client, self.cfg, hours, backfill)
+                jobs += found
+                for e in errs:
+                    self._err(e, "jsearch")
+                self.counts["jsearch_calls"] = calls
+                if ok:   # only a run that actually got answers counts toward the every_hours schedule
+                    self._succeeded("jsearch", bool(found), "JSearch")
+                    self.store.set_meta("jsearch_last_run", self.now.isoformat())
+                self._add_usage("jsearch_usage", calls)
+            else:
+                log.info("JSearch not due this hour (every_hours=%s)", js.get("every_hours"))
+
+        li = src.get("linkedin") or {}
+        if li.get("enabled"):
+            _, hours = self.lookback("linkedin")
+            windows["linkedin"] = hours
+            found, errs, billed = linkedin.fetch(client, self.cfg, hours)
+            jobs += found
+            for e in errs:
+                self._err(e, "linkedin")
+            if found or not errs:
+                self._succeeded("linkedin", bool(found), "LinkedIn")
+            self.counts["linkedin_results"] = billed
+            self._add_usage("linkedin_usage", billed)
+
+        di = src.get("dice") or {}
+        if di.get("enabled"):
+            _, hours = self.lookback("dice")
+            windows["dice"] = hours
+            found, errs, ok = dice.fetch(client, self.cfg, hours)
+            jobs += found
+            for e in errs:
+                self._err(e, "dice")
+            if ok:
+                self._succeeded("dice", bool(found), "Dice")
+            self.counts["dice_searches"] = ok
+
+        if src["ats_boards"].get("enabled") and self.companies:
+            _, hours = self.lookback("ats")
+            windows["ats"] = hours
+            self.cfg["freshness"]["effective_by_source"] = windows     # the Workday reader uses its window
+            companies = []
+            for c in self.companies:
+                name = c.get("name") or c.get("token") or c.get("tenant") or "?"
+                first_time = src["ats_boards"].get("new_company_backfill", False) and \
+                    self.store.get_meta(f"ats_seen:{name}") is None
+                companies.append({**c, "_backfill": True} if first_time else c)
+            found, errs, ok_names = collect_ats(client, companies, self.cfg)
+            jobs += found
+            for name, e in errs:
+                self._err(e, f"ats:{name}")
+            for name in ok_names:
+                self._mark_ok(f"ats:{name}")
+                self.store.set_meta(f"ats_seen:{name}", self.now.isoformat())
+            if ok_names:
+                self.store.set_meta("last_success:ats", self.now.isoformat())
+
+        fr = self.cfg["freshness"]
+        fr["effective_by_source"] = windows
+        fr["effective_hours"] = max(windows.values(), default=fr.get("max_age_hours", 24))
+        log.info("Look-back windows (hours): %s", ", ".join(f"{k} {v}" for k, v in windows.items()) or "none")
+        self.counts["collected"] = len(jobs)
+        return jobs
+
+    def _succeeded(self, source: str, found_any: bool, label: str) -> None:
+        """The source answered. Its next look-back starts from now. An answer with no postings at all is
+        reported as a problem, because a broken scraper or search looks exactly like a quiet day."""
+        self._mark_ok(source)
+        self.store.set_meta(f"last_success:{source}", self.now.isoformat())
+        if not found_any:
+            self._err(f"{label} answered but returned no postings at all; check its searches in config.yaml", source)
+
+    def _add_usage(self, meta_key: str, n: int) -> None:
+        if n:
+            month = self.now.strftime("%Y-%m")
+            used = json.loads(self.store.get_meta(meta_key, "{}"))
+            used[month] = used.get(month, 0) + n
+            self.store.set_meta(meta_key, json.dumps(used))
+
+    def lookback(self, source: str = "jsearch") -> tuple[bool, int]:
+        """(first successful run of this source?, hours to look back).
+        Each source keeps its own clock, so one that was down for days catches up when it returns."""
+        fr = self.cfg["freshness"]
+        normal, first = fr.get("max_age_hours", 24), fr.get("first_run_max_age_hours", 168)
+        if not fr.get("catch_up", False):
+            # Always the same window, whatever happened on earlier days. The small overlap covers a run that
+            # starts late (GitHub schedules often do); a posting seen twice is stored once.
+            return False, int(normal + fr.get("overlap_hours", 2))
+        last = self.store.get_meta(f"last_success:{source}")
+        if last is None and source != "dice":      # databases from before per-source clocks; Dice is new, so it backfills
+            last = self.store.get_meta("last_success")
+        if last is None:
+            return True, first
+        gap = (self.now - datetime.fromisoformat(last)).total_seconds() / 3600
+        return False, int(min(first, max(normal, gap + 1)))
+
+    # ---------- dedupe + filter ----------
+    def ingest(self, jobs: list) -> None:
+        batch = set()
+        for job in jobs:
+            if not job.title or not job.url:
+                continue
+            k = job.key
+            if k in batch:
+                continue
+            batch.add(k)
+            if self.store.known(k):
+                self.store.touch(k)
+                continue
+            fr = apply_filters(job, self.cfg, self.feedback, self.now)
+            self.store.insert(job, fr)
+            self.counts["new"] += 1
+            self.counts["candidates"] += fr.status == "candidate"
+        self.store.commit()
+
+    # ---------- score ----------
+    def score(self, feedback_notes: list[str]) -> None:
+        from .scorer import Scorer
+
+        sc = self.cfg["scoring"]
+        if self.scorer is None:
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                self._err("ANTHROPIC_API_KEY not set; scoring skipped", "claude")
+                return
+            self.scorer = Scorer(self.cfg, ROOT / "profile" / "profile.md", feedback_notes)
+        # Some models refuse a forced tool_choice. What was learned about each model is kept between runs,
+        # so a batch is built the right way the first time instead of failing and being redone with direct calls.
+        known = json.loads(self.store.get_meta("claude_models") or "{}")
+        if hasattr(self.scorer, "_auto_choice"):
+            self.scorer._auto_choice.update(known.get("auto_choice", []))
+        self._models_checked = set(known.get("checked", []))
+        try:
+            self._score(sc)
+        finally:
+            auto = sorted(getattr(self.scorer, "_auto_choice", []))
+            self.store.set_meta("claude_models", json.dumps({"checked": sorted(self._models_checked), "auto_choice": auto}))
+        self.counts["batches_pending"] = len(self._batches_pending())
+
+    def _score(self, sc: dict) -> None:
+        bc = sc.get("batch") or {}
+        if bc.get("enabled") and hasattr(self.scorer, "batch_submit"):
+            wait = bc.get("poll_minutes", 6) if self.wait_minutes is None else self.wait_minutes
+            budget = [float(wait)]                       # minutes this run may still wait, shared by both passes
+            if self._batch_phase("triage", budget):      # the full assessment needs the quick pass first
+                self._batch_phase("deep", budget)
+        else:
+            for row in self._rows_for("triage"):
+                self._score_one("triage", row)
+            self.store.commit()
+            for row in self._rows_for("deep"):
+                self._score_one("deep", row)
+            self.store.commit()
+
+    def _rows_for(self, kind: str) -> list:
+        """Postings waiting for a pass. A limit of null in config.yaml means no limit."""
+        sc = self.cfg["scoring"]
+        if kind == "triage":
+            where, limit = "status='candidate' ORDER BY first_seen DESC", sc.get("max_triage_per_run")
+        else:
+            where, limit = "status='awaiting_deep' ORDER BY triage_score DESC, first_seen DESC", sc.get("max_deep_per_run")
+        return self.store.rows(where + (" LIMIT ?" if limit else ""), (limit,) if limit else ())
+
+    def _score_one(self, kind: str, row, reply: dict | None = None) -> None:
+        """Apply one posting's result. Without a reply (direct mode, or a failed batch request) Claude is called now."""
+        step = "triage" if kind == "triage" else "assessment"
+        try:
+            if reply is None:
+                reply = self.scorer.triage(row) if kind == "triage" else self.scorer.assess(row)
+            (self._apply_triage if kind == "triage" else self._apply_assessment)(row, reply)
+        except Exception as e:      # one bad reply skips this job only; it is retried next run
+            self._score_failed(row, step, e)
+            return
+        self.counts["triaged" if kind == "triage" else "assessed"] += 1
+        self._mark_ok("claude")
+
+    def _apply_triage(self, row, reply: dict) -> None:
+        from .scorer import clean_triage
+        sc = self.cfg["scoring"]
+        floor = (self.cfg.get("salary") or {}).get("min_annual_usd")    # None: pay is shown, never used to reject
+        t = clean_triage(reply)
+        fields = {"triage_score": t["score"], "triage_reason": t["reason"]}
+        if t["location_check"] == "out_of_area":
+            fields |= {"status": "rejected_by_claude", "filter_reason": "Claude: outside search area. " + t["reason"]}
+        elif floor and t.get("pay_below_floor"):
+            fields |= {"status": "rejected_by_claude", "filter_reason": "Claude: pay below minimum"}
+        elif t["score"] < sc["deep_min_triage"]:
+            fields |= {"status": "triaged_low"}
+        else:
+            fields |= {"status": "awaiting_deep"}
+        self.store.update(row["key"], **fields)
+
+    def _apply_assessment(self, row, reply: dict) -> None:
+        from .scorer import clean_assessment, final_rank
+        floor = (self.cfg.get("salary") or {}).get("min_annual_usd")
+        a = clean_assessment(reply)
+        fields = {
+            "summary": a["summary"], "fit_pct": a["hiring_manager_fit_pct"], "ats_pct": a["keyword_match_pct"],
+            "seniority_pct": a["seniority_pay_pct"], "verdict": a["verdict"], "gaps": a["top_gaps"],
+            "hard_gaps": a["hard_gaps"], "pitch": a["pitch"], "work_model": a["work_model"] or row["work_model"],
+        }
+        pay_top = a.get("pay_top_annual_usd")
+        if a["location_check"] == "out_of_area":
+            fields |= {"status": "rejected_by_claude", "filter_reason": "Claude: outside search area"}
+        elif floor and pay_top and pay_top < floor:
+            fields |= {"status": "rejected_by_claude", "filter_reason": f"Claude: pay tops out at ${pay_top:,.0f}"}
+        else:
+            fields |= {"status": "scored", "rank": final_rank(a, row["posted_at"], self.cfg),
+                       "location_unclear": int(a["location_check"] == "unclear")}
+            if a["location_check"] == "remote_us" and not row["location_label"]:
+                fields["location_label"] = "Remote US"
+        self.store.update(row["key"], **fields)
+
+    # ---------- score through the Message Batches API ----------
+    def _batches_pending(self) -> dict[str, dict]:
+        out = {}
+        for kind in ("triage", "deep"):
+            raw = self.store.get_meta(f"batch:{kind}")
+            if raw:
+                out[kind] = json.loads(raw)
+        return out
+
+    def _batch_phase(self, kind: str, budget: list[float]) -> bool:
+        """Run one pass through a batch. Returns True when the pass is complete for every waiting posting,
+        False when a batch is still being processed (its id is kept, and a later run collects it)."""
+        bc = self.cfg["scoring"].get("batch") or {}
+        step = "quick pass" if kind == "triage" else "full assessment"
+        for _ in range(2):          # first an unfinished batch from an earlier run, then this run's postings
+            pending = self._batches_pending().get(kind)
+            if not pending:
+                rows = self._rows_for(kind)
+                if not rows:
+                    return True
+                model = self.cfg["scoring"]["triage_model" if kind == "triage" else "deep_model"]
+                if model not in self._models_checked:
+                    # First use of this model: score one posting directly. That call finds out whether the model
+                    # accepts a forced tool_choice, so the batch that follows is built correctly.
+                    self._score_one(kind, rows[0])
+                    self.store.commit()
+                    self._models_checked.add(model)
+                    rows = rows[1:]
+                    if not rows:
+                        return True
+                try:
+                    batch_id = self.scorer.batch_submit(kind, rows)
+                except Exception as e:      # the batch could not be created: score these directly instead
+                    self._err(f"Claude batch for the {step} could not be created ({e}); scored directly", "claude")
+                    for row in rows:
+                        self._score_one(kind, row)
+                    self.store.commit()
+                    return True
+                pending = {"id": batch_id, "keys": [r["key"] for r in rows], "at": self.now.isoformat()}
+                self.store.set_meta(f"batch:{kind}", json.dumps(pending))
+                log.info("Claude %s: batch %s submitted with %d postings", step, batch_id, len(rows))
+            if not self._batch_wait(kind, pending, budget, bc.get("poll_seconds", 30)):
+                return False
+            self._batch_collect(kind, pending)
+        return not self._batches_pending().get(kind)
+
+    def _batch_wait(self, kind: str, pending: dict, budget: list[float], interval: float) -> bool:
+        while True:
+            try:
+                if self.scorer.batch_ended(pending["id"]):
+                    return True
+            except Exception as e:
+                age_h = (self.now - datetime.fromisoformat(pending["at"])).total_seconds() / 3600
+                if age_h > 30:      # past the 24-hour batch limit and unreadable: let the postings be sent again
+                    self._err(f"Claude batch {pending['id']} could not be read after {age_h:.0f} hours; resubmitting", "claude")
+                    self.store.set_meta(f"batch:{kind}", "")
+                else:
+                    self._err(f"Claude batch {pending['id']} could not be checked: {e}", "claude")
+                return False
+            if budget[0] <= 0:
+                log.info("Claude batch %s is still processing; a later run will collect it", pending["id"])
+                return False
+            self._sleep(interval)
+            budget[0] -= interval / 60
+
+    def _batch_collect(self, kind: str, pending: dict) -> None:
+        results = self.scorer.batch_results(pending["id"])
+        waiting = "candidate" if kind == "triage" else "awaiting_deep"
+        retried = 0
+        for key in pending["keys"]:
+            rows = self.store.rows("key=?", (key,))
+            if not rows or rows[0]["status"] != waiting:
+                continue            # marked applied, blocked or removed while the batch was out
+            state, value = results.get(key, ("error", "no result in the batch"))
+            if state == "ok":
+                self._score_one(kind, rows[0], value)
+            else:                   # errored, expired or unreadable: one direct call, which also handles tool_choice fallbacks
+                retried += 1
+                log.info("batch result for %s unusable (%s); calling Claude directly", rows[0]["title"], value)
+                self._score_one(kind, rows[0])
+        self.store.set_meta(f"batch:{kind}", "")
+        self.store.commit()
+        log.info("Claude batch %s collected: %d postings, %d retried directly", pending["id"], len(pending["keys"]), retried)
+
+    def _score_failed(self, row, step: str, err: Exception) -> None:
+        attempts = (row["score_attempts"] or 0) + 1
+        fields = {"score_attempts": attempts}
+        if attempts >= 3:
+            fields |= {"status": "score_failed", "filter_reason": f"Claude {step} failed 3 times: {err}"}
+        self.store.update(row["key"], **fields)
+        self.store.commit()
+        self._err(f"{step} failed for {row['title']} at {row['company']} (attempt {attempts} of 3): {err}",
+                  "claude", row["key"])
+        log.warning("%s failed for %s at %s (attempt %d): %s", step, row["title"], row["company"], attempts, err)
+
+    # ---------- notify ----------
+    def alerts(self) -> None:
+        a = self.cfg["alerts"]
+        if a.get("instant_min_score") is None:
+            return
+        since = (self.now - timedelta(hours=48)).isoformat()
+        rows = self.store.rows("status='scored' AND rank>=? AND alerted_at IS NULL AND first_seen>=? ORDER BY rank DESC",
+                               (a["instant_min_score"], since))
+        rows = rows[:15]     # the rest go out with the next alert
+        if not rows:
+            return
+        subject, body, text = notify.alert_email(rows)
+        if self.dry_run:
+            (self.out / "emails").mkdir(parents=True, exist_ok=True)
+            (self.out / "emails" / "alert.html").write_text(body)
+            sent = True
+        else:
+            sent = notify.send(a["to"], subject, body, text, self.out / "emails")
+        if sent:
+            for r in rows:
+                self.store.update(r["key"], alerted_at=now_iso())
+            self.store.commit()
+            self.counts["alerted"] = len(rows)
+
+    def digest(self, force: bool = False) -> bool:
+        a = self.cfg["alerts"]
+        tz = ZoneInfo(a["timezone"])
+        local = self.now.astimezone(tz)
+        today = local.date().isoformat()
+        every_run = a.get("digest_every_run", False)
+        if not (force or every_run) and (local.hour != a["digest_hour_local"] or self.store.get_meta("last_digest") == today):
+            return False
+        last = self.store.get_meta("last_digest_at")
+        since = last if last and (self.now - datetime.fromisoformat(last)) < timedelta(days=7) \
+            else (self.now - timedelta(hours=24)).isoformat()
+        week_ago = (self.now - timedelta(days=7)).isoformat()
+        rows = self.store.rows("status='scored' AND rank>=? AND digested_at IS NULL AND first_seen>=? "
+                               "ORDER BY rank DESC LIMIT 40", (a["digest_min_score"], week_ago))
+        latest: dict[str, tuple[str, int]] = {}
+        for t, e in self.open_problems(since):
+            n = latest.get(e, ("", 0))[1] + 1
+            latest[e] = (max(t, latest.get(e, ("", 0))[0]), n)
+        recent = []
+        for e, (t, n) in sorted(latest.items(), key=lambda kv: kv[1][0], reverse=True):
+            when = datetime.fromisoformat(t).astimezone(tz).strftime("%b %d %I:%M %p").replace(" 0", " ")
+            recent.append(f"Last seen {when}" + (f" ({n} runs)" if n > 1 else "") + f": {e}")
+        near = self.store.rows("status='triaged_low' AND triage_score>=? AND first_seen>=? ORDER BY triage_score DESC, "
+                               "first_seen DESC LIMIT 12", (self.cfg["scoring"]["deep_min_triage"] - 1, since))
+        subject, body, text = notify.digest_email(rows, self.store.stats_since(since),
+                                                  self.store.filter_reasons_since(since), recent, local.strftime("%b %d"),
+                                                  a.get("strong_match_score", 8.0), near)
+        if self.dry_run:
+            (self.out / "emails").mkdir(parents=True, exist_ok=True)
+            (self.out / "emails" / "digest.html").write_text(body)
+            sent = True
+        else:
+            sent = notify.send(a["to"], subject, body, text, self.out / "emails")
+        if sent:
+            self.store.set_meta("last_digest", today)
+            self.store.set_meta("last_digest_at", self.now.isoformat())
+            for r in rows:
+                self.store.update(r["key"], digested_at=now_iso())
+            self.store.commit()
+        return sent
+
+    # ---------- problems ----------
+    def _err(self, msg: str, source: str, key: str | None = None) -> None:
+        self.errors.append(msg)
+        self._err_records.append([self.now.isoformat(), msg, source, key])
+
+    def _mark_ok(self, source: str) -> None:
+        """Remember when a source last worked; older problems from it are then treated as fixed."""
+        self.store.set_meta(f"ok:{source}", self.now.isoformat())
+
+    def _recent_errors(self) -> list[list]:
+        out = []
+        for x in json.loads(self.store.get_meta("recent_errors", "[]")):
+            if len(x) == 2:   # saved by an older version: work out the source from the text
+                t, msg = x
+                src = "jsearch" if msg.startswith("JSearch") else (
+                    "claude" if ("triage failed" in msg or "assessment failed" in msg or "ANTHROPIC" in msg) else "other")
+                x = [t, msg, src, None]
+            out.append(x)
+        return out
+
+    def open_problems(self, since: str) -> list[tuple[str, str]]:
+        """Problems from the window that have NOT been fixed by a later success."""
+        cleared = self.store.get_meta("errors_cleared_at", "")
+        out = []
+        for t, msg, src, key in self._recent_errors():
+            if t < since or (cleared and t <= cleared):
+                continue
+            if key:   # tied to one job: open only while that job is still waiting to be scored, or failed for good
+                r = self.store.db.execute("SELECT status FROM jobs WHERE key=?", (key,)).fetchone()
+                if r is None or r["status"] not in ("candidate", "awaiting_deep", "score_failed"):
+                    continue
+                if r["status"] != "score_failed" and (self.store.get_meta(f"ok:{src}") or "") > t:
+                    continue   # the job is queued again and Claude is working now
+            elif (self.store.get_meta(f"ok:{src}") or "") > t:
+                continue       # the same source has worked since
+            out.append((t, msg))
+        return out
+
+    def clear_problems(self) -> None:
+        self.store.set_meta("errors_cleared_at", self.now.isoformat())
+        log.info("Problem list cleared; only problems from now on will be reported")
+
+    def _save_errors(self) -> None:
+        keep_since = (self.now - timedelta(hours=24)).isoformat()
+        errs = [e for e in self._recent_errors() if e[0] >= keep_since] + self._err_records
+        self._err_records = []      # saved; a second call in the same run adds only what is new
+        self.store.set_meta("recent_errors", json.dumps(errs[-150:]))
+
+    # ---------- export ----------
+    def export(self) -> None:
+        self.out.mkdir(parents=True, exist_ok=True)
+        since = (self.now - timedelta(days=7)).isoformat()
+        rows = self.store.rows("status IN ('scored','applied') AND first_seen>=? ORDER BY rank DESC", (since,))
+        cols = ["rank", "verdict", "fit_pct", "ats_pct", "title", "company", "location_label", "work_model",
+                "salary_note", "skills", "posted_at", "first_seen", "status", "url", "summary", "pitch", "gaps", "hard_gaps", "employment_type", "publisher"]
+        with open(self.out / "ranked.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for r in rows:
+                w.writerow([r[c] for c in cols])
+        e = html.escape
+        trs = "".join(
+            f"<tr><td>{r['rank']:.1f}</td><td>{e(r['verdict'] or '')}</td><td><a href='{e(r['url'])}'>{e(r['title'])}</a></td>"
+            f"<td>{e(r['company'])}</td><td>{e(r['location_label'] or '')}</td><td>{e(r['salary_note'] or '')}</td>"
+            f"<td>{(r['first_seen'] or '')[:10]}</td></tr>" for r in rows)
+        (self.out / "report.html").write_text(
+            "<!doctype html><meta charset='utf-8'><title>Job Radar, last 7 days</title>"
+            "<style>body{font-family:Arial,sans-serif;margin:24px}td,th{padding:6px 10px;border-bottom:1px solid #ddd;text-align:left}</style>"
+            f"<h2>Job Radar: ranked jobs, last 7 days ({len(rows)})</h2><table><tr><th>Rank</th><th>Verdict</th><th>Role</th>"
+            f"<th>Company</th><th>Location</th><th>Pay</th><th>Found</th></tr>{trs}</table>")
+
+    # ---------- orchestrate ----------
+    def collect_due(self) -> bool:
+        """Sources are read once per cycle (collect_every_hours). The other runs of the day only pick up
+        Claude batches, so paid sources are not called again."""
+        if self.force_collect:
+            return True
+        last = self.store.get_meta("last_collect_at")
+        every = self.cfg.get("schedule", {}).get("collect_every_hours", 20)
+        return last is None or (self.now - datetime.fromisoformat(last)) >= timedelta(hours=every)
+
+    def execute(self, digest_force: bool = False, clear_errors: bool = False) -> dict:
+        if clear_errors:
+            self.clear_problems()
+        notes = self.apply_feedback()
+        if self.collect_due():
+            self.ingest(self.collect())
+            self.store.set_meta("last_collect_at", self.now.isoformat())
+            self.store.set_meta("digest_due", "1")
+        else:
+            log.info("Sources already read this cycle; this run only continues the scoring")
+        self.score(notes)
+        pending = self._batches_pending()
+        due = self.store.get_meta("digest_due") == "1"
+        send = digest_force or (due and (not pending or self.final))
+        if send and pending:
+            n = sum(len(p["keys"]) for p in pending.values())
+            self._err(f"{n} postings were still being scored by Claude when this email went out; "
+                      "they will be in the next one", "claude-batch")
+        mail_error = None
+        try:
+            if send:
+                self.alerts()
+            self._save_errors()
+            if send and self.digest(force=True):
+                self.store.set_meta("digest_due", "0")
+            elif not send:
+                log.info("Digest held: %s", "Claude is still scoring" if pending else "nothing new since the last one")
+        except Exception as e:      # a mail failure must not lose the report or the run summary
+            mail_error = e
+            self._err(f"Email could not be sent: {e}", "email")
+            self._save_errors()
+        self.export()
+        self.store.prune((self.now - timedelta(days=30)).isoformat())
+        self.summary()
+        if mail_error:
+            raise mail_error        # fail the run so GitHub reports it
+        return self.counts
+
+    def summary(self) -> None:
+        c = self.counts
+        usage = json.loads(self.store.get_meta("jsearch_usage", "{}")).get(self.now.strftime("%Y-%m"), 0)
+        lines = [
+            f"Collected {c['collected']} postings, {c['new']} new, {c['candidates']} passed filters.",
+            f"Claude triaged {c['triaged']}, assessed {c['assessed']}; {c['alerted']} sent as alerts.",
+            f"JSearch requests this run {c['jsearch_calls']}, this month {usage}.",
+            f"LinkedIn (Apify) results this run {c['linkedin_results']}, this month "
+            f"{json.loads(self.store.get_meta('linkedin_usage', '{}')).get(self.now.strftime('%Y-%m'), 0)}.",
+            f"Dice searches answered this run {c['dice_searches']}.",
+            f"Claude batches still processing: {c['batches_pending']}.",
+        ] + [f"Problem: {e}" for e in self.errors]
+        for line in lines:
+            log.info(line)
+        if os.environ.get("GITHUB_STEP_SUMMARY"):
+            with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                f.write("### Job Radar run\n" + "\n".join(f"- {l}" for l in lines) + "\n")
