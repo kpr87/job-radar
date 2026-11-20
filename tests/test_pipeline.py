@@ -482,7 +482,10 @@ def test_batch_scoring_completes_in_one_run_when_claude_is_quick(home):
     assert kinds == ["triage", "deep"]                              # one batch per pass, in order
     assert c["batches_pending"] == 0 and slept == []
     assert c["triaged"] >= 8 and c["assessed"] >= 6
-    assert scorer.direct_calls == 2                                 # the one failed request, retried directly in each pass
+    # direct calls: one probe per model on first use (2), plus the one failed request retried in each pass (2)
+    assert scorer.direct_calls == 4
+    assert json.loads(run.store.get_meta("claude_models"))["checked"] == sorted(
+        {run.cfg["scoring"]["triage_model"], run.cfg["scoring"]["deep_model"]})
     assert run.store.rows("title='Agentic AI Architect'")[0]["status"] == "scored"
     assert run.store.rows("status IN ('candidate','awaiting_deep')") == []      # no per-run limit: nothing left waiting
     assert (tmp / "out" / "emails" / "digest.html").exists()        # scoring complete, so the digest went out
@@ -502,7 +505,7 @@ def test_batch_scoring_carries_over_runs_and_reads_sources_once(home):
         return r, r.execute()
 
     r1, c1 = run_at(0)                              # 6:23 run: reads sources, submits the quick pass, does not wait
-    assert c1["collected"] > 0 and c1["batches_pending"] == 1 and c1["triaged"] == 0
+    assert c1["collected"] > 0 and c1["batches_pending"] == 1 and c1["triaged"] == 1     # 1 = the one-time model probe
     assert not digest.exists()                      # held: Claude is still scoring
     calls_after_first = len(DICE_CALLS)
 
@@ -523,7 +526,7 @@ def test_batch_scoring_carries_over_runs_and_reads_sources_once(home):
     r5, c5 = run_at(140)                            # the batch ends; results are applied, held for the next digest
     assert c5["assessed"] >= 6 and c5["batches_pending"] == 0
     assert r5.store.rows("status='scored' AND digested_at IS NULL") != []
-    assert scorer.direct_calls == 0                 # everything went through batches
+    assert scorer.direct_calls == 2                 # only the one-time probe per model; everything else went through batches
 
     r6, c6 = run_at(24 * 60)                        # next morning: sources read again, yesterday's results in this digest
     assert c6["collected"] > 0 and digest.exists()
@@ -547,6 +550,42 @@ def test_default_window_is_one_day_on_every_source_every_time(home):
     assert date_posted_for(26) == "3days"
     # a posting older than the window is dropped, and a company added later gets no backfill
     assert "older than 26 hours" in run.store.rows("company='Old Post Co'")[0]["filter_reason"]
+
+
+def test_model_that_refuses_forced_tool_choice_is_remembered_between_runs(home):
+    """A model that rejects a forced tool_choice is found by the one-time probe, the batch is then built
+    without forcing, and the next run already knows (no failed batch, no repeat probe)."""
+    tmp, pl = home
+    _default_config(tmp)
+
+    class Picky(FakeBatchScorer):
+        def __init__(self, deep_model):
+            super().__init__(checks_needed=1)
+            self._auto_choice: set[str] = set()
+            self.deep_model, self.forced_in_batches = deep_model, []
+
+        def assess(self, row):
+            self._auto_choice.add(self.deep_model)          # what the real Scorer learns from the HTTP 400
+            return super().assess(row)
+
+        def batch_submit(self, kind, rows):
+            if kind == "deep":
+                self.forced_in_batches.append(self.deep_model not in self._auto_choice)
+            return super().batch_submit(kind, rows)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    first = pl.Run(dry_run=True, client=client, scorer=None, now=NOW, final=True, sleep=lambda s: None)
+    first.scorer = Picky(first.cfg["scoring"]["deep_model"])
+    first.execute()
+    assert first.scorer.forced_in_batches == [False]         # the deep batch was not forced
+    saved = json.loads(first.store.get_meta("claude_models"))
+    assert saved["auto_choice"] == [first.cfg["scoring"]["deep_model"]]
+
+    second = pl.Run(dry_run=True, client=client, scorer=None, now=NOW + timedelta(days=1), final=True, sleep=lambda s: None)
+    second.scorer = Picky(second.cfg["scoring"]["deep_model"])
+    second.score([])
+    assert second.cfg["scoring"]["deep_model"] in second.scorer._auto_choice     # loaded from the last run
+    assert second.scorer.direct_calls == 0                                       # no repeat probe
 
 
 def test_real_scorer_speaks_the_batch_api(tmp_path):
